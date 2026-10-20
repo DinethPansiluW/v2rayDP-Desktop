@@ -1,0 +1,6 @@
+{
+  "name": "v2rayDP Desktop",
+  "description": "High-performance VLESS & VMess desktop client with system proxy automation, hotspot sharing, ad-blocking, and latency testing powered by Xray-core.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
