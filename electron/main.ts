@@ -37,10 +37,19 @@ import { AutomationDecision } from '../src/core/AutomationDecision';
 import { BlockManager } from '../src/core/BlockManager';
 import defaultSources from '../src/assets/blocklist_sources.json';
 
-// Single Instance Lock
+// Single Instance Lock (B9)
 const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) {
   app.quit();
+  process.exit(0);
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      if (!mainWindow.isVisible()) mainWindow.show();
+      mainWindow.focus();
+    }
+  });
 }
 
 let mainWindow: BrowserWindow | null = null;
@@ -932,6 +941,7 @@ function updateTrayMenu(): void {
 function createMainWindow(): void {
   const iconPath = getAppIconPath();
   const iconImage = fs.existsSync(iconPath) ? nativeImage.createFromPath(iconPath) : undefined;
+  const shouldStartMinimized = store.settings.startMinimized || process.argv.includes('--minimized');
 
   mainWindow = new BrowserWindow({
     width: 1060,
@@ -941,7 +951,7 @@ function createMainWindow(): void {
     backgroundColor: '#090D16',
     title: 'v2rayDP Desktop',
     icon: iconImage,
-    show: !store.settings.startMinimized,
+    show: !shouldStartMinimized,
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(app.getAppPath(), 'dist-electron', 'preload.cjs'),
@@ -1061,8 +1071,10 @@ app.whenReady().then(async () => {
 
   // Configure Windows auto-start (app.setLoginItemSettings)
   if (process.platform === 'win32') {
+    const execPath = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
     app.setLoginItemSettings({
       openAtLogin: Boolean(store.settings.startWithWindows),
+      path: execPath,
       args: store.settings.startMinimized ? ['--minimized'] : []
     });
   }
@@ -1499,8 +1511,10 @@ ipcMain.handle('save-desktop-settings', async (_e, settings: DesktopSettings) =>
   saveStore();
 
   if (process.platform === 'win32') {
+    const execPath = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
     app.setLoginItemSettings({
       openAtLogin: Boolean(settings.startWithWindows),
+      path: execPath,
       args: settings.startMinimized ? ['--minimized'] : []
     });
   }
