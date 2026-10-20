@@ -451,7 +451,8 @@ export function initMockApi(): ApiInterface {
 
       for (const line of lines) {
         try {
-          if (line.startsWith('vless://') || line.startsWith('vmess://')) {
+          const lower = line.toLowerCase();
+          if (lower.startsWith('vless://') || lower.startsWith('vmess://') || lower.startsWith('trojan://')) {
             const parsed = VmessLinkParser.parse(line);
             parsed.isSelected = profiles.length === 0;
             profiles.push(parsed);

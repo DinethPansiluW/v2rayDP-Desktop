@@ -37,6 +37,25 @@ describe('VmessLinkParser', () => {
     expect(profile.name).toBe('Germany gRPC');
   });
 
+  it('should parse Trojan link correctly with modern pcs/vcn verification', () => {
+    const trojanLink =
+      'trojan://my-trojan-password@trojan.node.net:443?security=tls&type=ws&path=%2Ftrojan-ws&sni=trojan.node.net&fp=chrome&pcs=sha256hash123&vcn=certname.com#Tokyo%20Trojan';
+
+    const profile = VmessLinkParser.parse(trojanLink);
+
+    expect(profile.protocol).toBe('trojan');
+    expect(profile.name).toBe('Tokyo Trojan');
+    expect(profile.address).toBe('trojan.node.net');
+    expect(profile.port).toBe(443);
+    expect(profile.uuid).toBe('my-trojan-password');
+    expect(profile.network).toBe('ws');
+    expect(profile.path).toBe('/trojan-ws');
+    expect(profile.sni).toBe('trojan.node.net');
+    expect(profile.fingerprint).toBe('chrome');
+    expect(profile.pinnedPeerCertSha256).toBe('sha256hash123');
+    expect(profile.verifyPeerCertByName).toBe('certname.com');
+  });
+
   it('should parse VMess JSON Base64 link correctly', () => {
     const vmessConfig = {
       v: '2',
@@ -70,9 +89,9 @@ describe('VmessLinkParser', () => {
     expect(profile.tls).toBe('tls');
   });
 
-  it('should generate compliant Xray JSON config with allowInsecure: true and blackhole routing', () => {
+  it('should generate compliant Xray JSON config without allowInsecure (migrated to modern standards)', () => {
     const profile = VmessLinkParser.parse(
-      'vless://b831381d-6324-4d53-ad4f-8cda48b30811@198.51.100.25:443?type=tcp&security=tls&sni=server.com#TestNode'
+      'vless://b831381d-6324-4d53-ad4f-8cda48b30811@198.51.100.25:443?type=tcp&security=tls&sni=server.com&pcs=certsha256&vcn=server.com#TestNode'
     );
 
     const jsonString = VmessLinkParser.toV2RayConfigJson(profile, {
@@ -104,8 +123,14 @@ describe('VmessLinkParser', () => {
     expect(proxyOutbound).toBeDefined();
     expect(proxyOutbound.protocol).toBe('vless');
 
-    // TLS allowInsecure requirement
-    expect(proxyOutbound.streamSettings.tlsSettings.allowInsecure).toBe(true);
+    // TLS verification checks: allowInsecure MUST NOT exist!
+    expect(proxyOutbound.streamSettings.tlsSettings.allowInsecure).toBeUndefined();
+    expect(proxyOutbound.streamSettings.tlsSettings.serverName).toBe('server.com');
+    expect(proxyOutbound.streamSettings.tlsSettings.pinnedPeerCertSha256).toEqual(['certsha256']);
+    expect(proxyOutbound.streamSettings.tlsSettings.verifyPeerCertByName).toEqual(['server.com']);
+
+    // Ensure raw string does not contain allowInsecure
+    expect(jsonString).not.toContain('allowInsecure');
 
     // Blackhole ad-blocking outbound
     const blockOutbound = parsed.outbounds.find((o: any) => o.tag === 'block');

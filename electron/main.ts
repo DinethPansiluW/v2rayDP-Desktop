@@ -385,33 +385,167 @@ function runSerialized<T>(fn: () => Promise<T>): Promise<T> {
   return result;
 }
 
-function waitForPort(port: number, timeoutMs = 8000): Promise<boolean> {
+interface PortCheckResult {
+  ready: boolean;
+  error?: string;
+}
+
+/**
+ * NetMod-style preflight node connectivity probe.
+ * Checks if the remote server host:port can establish a TCP/TLS connection.
+ * Rapid fail-fast: catches DNS resolution errors, connection refused, or timeouts in <= 2.5s.
+ */
+function fastNodeCheck(
+  address: string,
+  port: number,
+  tlsMode: 'none' | 'tls' | 'reality',
+  sni: string,
+  timeoutMs = 2500
+): Promise<{ ok: boolean; latencyMs?: number; error?: string }> {
   const start = Date.now();
   return new Promise((resolve) => {
+    let resolved = false;
+    const socket = new net.Socket();
+
+    const finish = (ok: boolean, error?: string) => {
+      if (resolved) return;
+      resolved = true;
+      socket.destroy();
+      resolve({
+        ok,
+        latencyMs: Date.now() - start,
+        error
+      });
+    };
+
+    socket.setTimeout(timeoutMs);
+
+    socket.once('connect', () => {
+      if (tlsMode === 'tls' || tlsMode === 'reality') {
+        const tlsSocket = tls.connect(
+          {
+            socket,
+            servername: sni || address,
+            rejectUnauthorized: false
+          },
+          () => {
+            tlsSocket.destroy();
+            finish(true);
+          }
+        );
+        tlsSocket.on('error', () => {
+          tlsSocket.destroy();
+          // Even if cert mismatch or self-signed, TCP/TLS handshake reached server
+          finish(true);
+        });
+      } else {
+        finish(true);
+      }
+    });
+
+    socket.once('error', (err: any) => {
+      finish(false, err.code || err.message || 'Connection refused');
+    });
+
+    socket.once('timeout', () => {
+      finish(false, 'Connection timed out (server not responding)');
+    });
+
+    try {
+      socket.connect(port, address);
+    } catch (err: any) {
+      finish(false, err.message);
+    }
+  });
+}
+
+/**
+ * High-performance, process-aware local port ready checker.
+ * Monitors child process lifecycle and terminates immediately on exit/failure,
+ * avoiding blind multi-second timeout loops.
+ */
+function waitForLocalPort(
+  port: number,
+  child: ChildProcess,
+  getLastStderr: () => string,
+  timeoutMs = 2500
+): Promise<PortCheckResult> {
+  const start = Date.now();
+  return new Promise((resolve) => {
+    let timer: NodeJS.Timeout | null = null;
+    let finished = false;
+
+    const cleanup = () => {
+      finished = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+
+    const done = (res: PortCheckResult) => {
+      if (finished) return;
+      cleanup();
+      resolve(res);
+    };
+
+    // If the process crashes or exits during startup, abort immediately!
+    child.once('exit', (code, signal) => {
+      done({
+        ready: false,
+        error: getLastStderr() || `Xray core exited prematurely (code: ${code}, signal: ${signal})`
+      });
+    });
+
     const check = () => {
+      if (finished) return;
+
+      if (child.exitCode !== null || child.killed) {
+        return done({
+          ready: false,
+          error: getLastStderr() || `Xray core process exited with code ${child.exitCode}`
+        });
+      }
+
+      if (Date.now() - start >= timeoutMs) {
+        return done({
+          ready: false,
+          error: getLastStderr() || `Timed out after ${timeoutMs}ms waiting for SOCKS port ${port}`
+        });
+      }
+
       const socket = new net.Socket();
-      socket.setTimeout(400);
+      socket.setTimeout(250);
 
       socket.once('connect', () => {
-        socket.destroy();
-        resolve(true);
+        // Send SOCKS5 greeting [0x05, 0x01, 0x00]
+        try {
+          socket.write(Buffer.from([0x05, 0x01, 0x00]));
+          socket.once('data', () => {
+            socket.destroy();
+            done({ ready: true });
+          });
+          setTimeout(() => {
+            socket.destroy();
+            done({ ready: true });
+          }, 60);
+        } catch {
+          socket.destroy();
+          done({ ready: true });
+        }
       });
 
       socket.once('error', () => {
         socket.destroy();
-        if (Date.now() - start >= timeoutMs) {
-          resolve(false);
-        } else {
-          setTimeout(check, 250);
+        if (!finished) {
+          timer = setTimeout(check, 40);
         }
       });
 
       socket.once('timeout', () => {
         socket.destroy();
-        if (Date.now() - start >= timeoutMs) {
-          resolve(false);
-        } else {
-          setTimeout(check, 250);
+        if (!finished) {
+          timer = setTimeout(check, 40);
         }
       });
 
@@ -511,7 +645,7 @@ async function startXrayInternal(profile: ServerProfile): Promise<boolean> {
   // Stay in 'connecting' until verified
   currentConnectionState = {
     status: 'connecting',
-    reason: `Starting Xray with ${profile.name}...`,
+    reason: `Connecting to ${profile.name}...`,
     profileName: profile.name,
     activeProfile: profile,
     connectedAt: Date.now(),
@@ -521,6 +655,24 @@ async function startXrayInternal(profile: ServerProfile): Promise<boolean> {
   };
   mainWindow?.webContents.send('on-state-change', currentConnectionState);
   updateTrayMenu();
+
+  // NetMod-Style Fast Connection preflight probe:
+  // Rapid fail-fast check: immediately tests server reachability before spawning or locking proxy
+  addLog('INFO', 'Xray', `Checking server availability: ${profile.address}:${profile.port}...`);
+  const preflight = await fastNodeCheck(profile.address, profile.port, profile.tls, profile.sni, 2500);
+  if (!preflight.ok) {
+    const errorMsg = `Server unreachable (${profile.address}:${profile.port}): ${preflight.error}`;
+    addLog('WARN', 'Xray', errorMsg);
+    currentConnectionState = {
+      status: 'error',
+      reason: errorMsg,
+      activeProfile: null
+    };
+    mainWindow?.webContents.send('on-state-change', currentConnectionState);
+    updateTrayMenu();
+    return false;
+  }
+  addLog('INFO', 'Xray', `Server responded (${preflight.latencyMs}ms). Initializing Xray engine...`);
 
   const activeBlockedDomains = getActiveBlockedDomains();
 
@@ -583,11 +735,11 @@ async function startXrayInternal(profile: ServerProfile): Promise<boolean> {
       }
     });
 
-    // Poll SOCKS port for up to 8s
-    const isPortReady = await waitForPort(socksPort, 8000);
+    // NetMod-style process-aware port readiness verification (terminates immediately if process exits)
+    const portResult = await waitForLocalPort(socksPort, child, () => lastStderr, 2500);
 
-    if (!isPortReady || earlyExitCode !== null || child !== currentXrayChild) {
-      const failReason = lastStderr || 'Failed to initialize Xray engine or bind SOCKS port';
+    if (!portResult.ready || earlyExitCode !== null || child !== currentXrayChild) {
+      const failReason = portResult.error || lastStderr || 'Failed to initialize Xray engine or bind SOCKS port';
       addLog('ERROR', 'Xray', `Startup failure: ${failReason}`);
       await stopCurrentXrayProcess();
 
@@ -1199,7 +1351,11 @@ ipcMain.handle('import-profiles-text', async (_e, text: string) => {
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
-    if (trimmed.toLowerCase().startsWith('vless://') || trimmed.toLowerCase().startsWith('vmess://')) {
+    if (
+      trimmed.toLowerCase().startsWith('vless://') ||
+      trimmed.toLowerCase().startsWith('vmess://') ||
+      trimmed.toLowerCase().startsWith('trojan://')
+    ) {
       try {
         const parsed = VmessLinkParser.parse(trimmed);
         parsed.id = `prof-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
@@ -1232,7 +1388,12 @@ ipcMain.handle('import-profiles-json', async (_e, jsonStr: string) => {
     const list = Array.isArray(parsed) ? parsed : [parsed];
 
     for (const item of list) {
-      if (item.address && item.port && item.uuid && (item.protocol === 'vless' || item.protocol === 'vmess')) {
+      if (
+        item.address &&
+        item.port &&
+        item.uuid &&
+        (item.protocol === 'vless' || item.protocol === 'vmess' || item.protocol === 'trojan')
+      ) {
         const profile: ServerProfile = {
           id: `prof-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
           name: item.name || 'Imported Node',

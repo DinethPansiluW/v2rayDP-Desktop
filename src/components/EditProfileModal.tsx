@@ -18,7 +18,7 @@ export const EditProfileModal: React.FC<EditProfileModalProps> = ({
   onSave
 }) => {
   const [name, setName] = useState('');
-  const [protocol, setProtocol] = useState<'vless' | 'vmess'>('vless');
+  const [protocol, setProtocol] = useState<'vless' | 'vmess' | 'trojan'>('vless');
   const [address, setAddress] = useState('');
   const [port, setPort] = useState(443);
   const [uuid, setUuid] = useState('');
@@ -38,6 +38,8 @@ export const EditProfileModal: React.FC<EditProfileModalProps> = ({
   const [spiderX, setSpiderX] = useState('/');
   const [serviceName, setServiceName] = useState('');
   const [grpcMode, setGrpcMode] = useState('gun');
+  const [pinnedPeerCertSha256, setPinnedPeerCertSha256] = useState('');
+  const [verifyPeerCertByName, setVerifyPeerCertByName] = useState('');
 
   const [activeTab, setActiveTab] = useState<'basic' | 'transport' | 'tls'>('basic');
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -66,8 +68,10 @@ export const EditProfileModal: React.FC<EditProfileModalProps> = ({
       setSpiderX(profile.spiderX || '/');
       setServiceName(profile.serviceName || '');
       setGrpcMode(profile.grpcMode || 'gun');
+      setPinnedPeerCertSha256(profile.pinnedPeerCertSha256 || '');
+      setVerifyPeerCertByName(profile.verifyPeerCertByName || '');
     } else {
-      setName(defaultProtocol === 'vless' ? 'New VLESS Reality Node' : 'New VMess Node');
+      setName(defaultProtocol === 'vless' ? 'New VLESS Reality Node' : 'New Node');
       setProtocol(defaultProtocol);
       setAddress('');
       setPort(443);
@@ -88,6 +92,8 @@ export const EditProfileModal: React.FC<EditProfileModalProps> = ({
       setSpiderX('/');
       setServiceName('');
       setGrpcMode('gun');
+      setPinnedPeerCertSha256('');
+      setVerifyPeerCertByName('');
     }
     setError(null);
   }, [profile, defaultProtocol, isOpen]);
@@ -105,7 +111,7 @@ export const EditProfileModal: React.FC<EditProfileModalProps> = ({
       return;
     }
     if (!uuid.trim()) {
-      setError('UUID is required');
+      setError(protocol === 'trojan' ? 'Password is required' : 'UUID is required');
       return;
     }
 
@@ -136,7 +142,8 @@ export const EditProfileModal: React.FC<EditProfileModalProps> = ({
         spiderX: spiderX.trim() || '/',
         serviceName: serviceName.trim(),
         grpcMode,
-        allowInsecure: true
+        pinnedPeerCertSha256: pinnedPeerCertSha256.trim(),
+        verifyPeerCertByName: verifyPeerCertByName.trim()
       });
       onClose();
     } catch (err: unknown) {
@@ -223,9 +230,9 @@ export const EditProfileModal: React.FC<EditProfileModalProps> = ({
                   <select
                     value={protocol}
                     onChange={(e) => {
-                      const p = e.target.value as 'vless' | 'vmess';
+                      const p = e.target.value as 'vless' | 'vmess' | 'trojan';
                       setProtocol(p);
-                      if (p === 'vmess' && tls === 'reality') {
+                      if ((p === 'vmess' || p === 'trojan') && tls === 'reality') {
                         setTls('tls');
                       }
                     }}
@@ -233,6 +240,7 @@ export const EditProfileModal: React.FC<EditProfileModalProps> = ({
                   >
                     <option value="vless">VLESS</option>
                     <option value="vmess">VMess</option>
+                    <option value="trojan">Trojan</option>
                   </select>
                 </div>
 
@@ -482,6 +490,29 @@ export const EditProfileModal: React.FC<EditProfileModalProps> = ({
                       placeholder="h2,http/1.1"
                       className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3.5 py-2 text-sm text-white focus:outline-none focus:border-cyan-500 font-mono"
                     />
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-300 mb-1.5">Pinned Cert SHA256 (pcs)</label>
+                      <input
+                        type="text"
+                        value={pinnedPeerCertSha256}
+                        onChange={(e) => setPinnedPeerCertSha256(e.target.value)}
+                        placeholder="Optional: hash1,hash2"
+                        className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3.5 py-2 text-sm text-white focus:outline-none focus:border-cyan-500 font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-300 mb-1.5">Verify Cert By Name (vcn)</label>
+                      <input
+                        type="text"
+                        value={verifyPeerCertByName}
+                        onChange={(e) => setVerifyPeerCertByName(e.target.value)}
+                        placeholder="Optional: cert-name"
+                        className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3.5 py-2 text-sm text-white focus:outline-none focus:border-cyan-500 font-mono"
+                      />
+                    </div>
                   </div>
 
                   {protocol === 'vless' && network === 'tcp' && (

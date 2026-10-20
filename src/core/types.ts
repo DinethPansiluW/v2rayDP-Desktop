@@ -6,7 +6,7 @@
 export interface ServerProfile {
   id: string;
   name: string;
-  protocol: 'vless' | 'vmess';
+  protocol: 'vless' | 'vmess' | 'trojan';
   address: string;
   port: number;
   uuid: string;
@@ -26,7 +26,9 @@ export interface ServerProfile {
   spiderX: string; // spx for Reality (e.g. / or custom)
   serviceName: string; // for gRPC transport
   grpcMode: string; // "gun", "multi"
-  allowInsecure?: boolean; // Always true in v2rayDP
+  pinnedPeerCertSha256?: string; // pcs in modern Xray 26+
+  verifyPeerCertByName?: string; // vcn in modern Xray 26+
+  allowInsecure?: boolean; // Legacy field, sanitized before config.json emission
   isSelected?: boolean;
   pingLatencyMs?: number; // -1 if failed or not tested
   lastPingTimestamp?: number;

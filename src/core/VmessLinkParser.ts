@@ -1,13 +1,13 @@
 /**
- * v2rayDP Desktop - Vmess & VLESS Link Parser & Xray-core Config Generator
- * Ported faithfully from VmessLinkParser.kt (v2rayDP Android)
+ * v2rayDP Desktop - Vmess, VLESS & Trojan Link Parser & Xray-core Config Generator
+ * Built with full compatibility for modern Xray-core (v1.8+ through v26+).
  */
 
 import { ServerProfile } from './types';
 
 export class VmessLinkParser {
   /**
-   * Parses either a vless:// or vmess:// link into a ServerProfile.
+   * Parses either a vless://, vmess://, or trojan:// link into a ServerProfile.
    */
   static parse(rawInput: string): ServerProfile {
     const link = rawInput.trim();
@@ -15,8 +15,10 @@ export class VmessLinkParser {
       return this.parseVlessLink(link);
     } else if (link.toLowerCase().startsWith('vmess://')) {
       return this.parseVmessLink(link);
+    } else if (link.toLowerCase().startsWith('trojan://')) {
+      return this.parseTrojanLink(link);
     } else {
-      throw new Error('Link must start with vmess:// or vless://');
+      throw new Error('Link must start with vless://, vmess://, or trojan://');
     }
   }
 
@@ -102,7 +104,10 @@ export class VmessLinkParser {
     const spx = queryMap['spx'] || queryMap['spiderx'] || queryMap['spider_x'] || '';
 
     const host = queryMap['host'] || '';
-    const path = queryMap['path'] || '/';
+    let path = queryMap['path'] || '/';
+    if (!path.startsWith('/')) {
+      path = `/${path}`;
+    }
     const sni = queryMap['sni'] || queryMap['peer'] || queryMap['servername'] || queryMap['server_name'] || host || address;
     const alpn = queryMap['alpn'] || '';
     const headerType = queryMap['headertype'] || queryMap['header_type'] || 'none';
@@ -113,6 +118,10 @@ export class VmessLinkParser {
 
     const serviceName = queryMap['servicename'] || queryMap['service_name'] || (network === 'grpc' ? path.replace(/^\//, '') : '');
     const grpcMode = queryMap['mode'] || 'gun';
+
+    // Modern TLS verification params (migrated from allowInsecure in Xray 26+)
+    const pcs = queryMap['pcs'] || queryMap['pinnedpeercertsha256'] || '';
+    const vcn = queryMap['vcn'] || queryMap['verifypeercertbyname'] || '';
 
     let tlsMode: 'none' | 'tls' | 'reality' = 'none';
     if (securityRaw === 'reality' || pbk.length > 0) {
@@ -144,7 +153,8 @@ export class VmessLinkParser {
       spiderX: spx,
       serviceName,
       grpcMode,
-      allowInsecure: true,
+      pinnedPeerCertSha256: pcs,
+      verifyPeerCertByName: vcn,
       pingLatencyMs: -1,
       createdAt: Date.now()
     };
@@ -162,6 +172,116 @@ export class VmessLinkParser {
     }
   }
 
+  /**
+   * Standard Trojan URI format:
+   * trojan://password@host:port?security=tls&sni=...&type=tcp#remarks
+   */
+  static parseTrojanLink(link: string): ServerProfile {
+    const withoutScheme = link.substring(9).trim();
+    const fragmentIndex = withoutScheme.indexOf('#');
+    let remarks = 'Trojan Node';
+    if (fragmentIndex !== -1) {
+      try {
+        remarks = decodeURIComponent(withoutScheme.substring(fragmentIndex + 1)).trim();
+      } catch {
+        remarks = withoutScheme.substring(fragmentIndex + 1).trim() || 'Trojan Node';
+      }
+    }
+
+    const mainPart = fragmentIndex !== -1 ? withoutScheme.substring(0, fragmentIndex) : withoutScheme;
+    const queryIndex = mainPart.indexOf('?');
+    const authorityPart = queryIndex !== -1 ? mainPart.substring(0, queryIndex) : mainPart;
+    const queryPart = queryIndex !== -1 ? mainPart.substring(queryIndex + 1) : '';
+
+    const atIndex = authorityPart.lastIndexOf('@');
+    if (atIndex === -1) {
+      throw new Error("Invalid Trojan URI: Missing '@' delimiter");
+    }
+
+    const password = authorityPart.substring(0, atIndex).trim();
+    let hostPort = authorityPart.substring(atIndex + 1).trim();
+    if (hostPort.endsWith('/')) {
+      hostPort = hostPort.slice(0, -1);
+    }
+
+    let address = '';
+    let port = 443;
+    if (hostPort.startsWith('[')) {
+      const closeBracket = hostPort.indexOf(']');
+      if (closeBracket === -1) throw new Error('Invalid IPv6 address in Trojan URI');
+      address = hostPort.substring(1, closeBracket).trim();
+      const portStr = hostPort.substring(closeBracket + 1).replace(/^:/, '').replace(/\/$/, '').trim();
+      port = parseInt(portStr, 10) || 443;
+    } else if (hostPort.includes(':')) {
+      const colonIndex = hostPort.lastIndexOf(':');
+      address = hostPort.substring(0, colonIndex).trim().replace(/\/$/, '');
+      const portStr = hostPort.substring(colonIndex + 1).replace(/^:/, '').replace(/\/$/, '').trim();
+      port = parseInt(portStr, 10) || 443;
+    } else {
+      address = hostPort.replace(/\/$/, '');
+      port = 443;
+    }
+
+    const queryMap: Record<string, string> = {};
+    if (queryPart.length > 0) {
+      const pairs = queryPart.split('&');
+      for (const pair of pairs) {
+        const eq = pair.indexOf('=');
+        if (eq !== -1) {
+          const key = pair.substring(0, eq).trim().toLowerCase();
+          const rawVal = pair.substring(eq + 1).trim();
+          try {
+            queryMap[key] = decodeURIComponent(rawVal);
+          } catch {
+            queryMap[key] = rawVal;
+          }
+        }
+      }
+    }
+
+    const networkRaw = queryMap['type'] || queryMap['net'] || 'tcp';
+    const network = networkRaw.toLowerCase().trim() as 'tcp' | 'ws' | 'grpc' | 'h2';
+    const host = queryMap['host'] || '';
+    let path = queryMap['path'] || '/';
+    if (!path.startsWith('/')) {
+      path = `/${path}`;
+    }
+    const sni = queryMap['sni'] || queryMap['peer'] || host || address;
+    const alpn = queryMap['alpn'] || '';
+    const fp = queryMap['fp'] || queryMap['fingerprint'] || 'chrome';
+    const pcs = queryMap['pcs'] || queryMap['pinnedpeercertsha256'] || '';
+    const vcn = queryMap['vcn'] || queryMap['verifypeercertbyname'] || '';
+
+    return {
+      id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 12),
+      name: remarks,
+      protocol: 'trojan',
+      address,
+      port,
+      uuid: password,
+      alterId: 0,
+      security: 'none',
+      network,
+      headerType: 'none',
+      host,
+      path,
+      tls: 'tls',
+      sni,
+      alpn,
+      flow: '',
+      publicKey: '',
+      shortId: '',
+      fingerprint: fp,
+      spiderX: '',
+      serviceName: '',
+      grpcMode: 'gun',
+      pinnedPeerCertSha256: pcs,
+      verifyPeerCertByName: vcn,
+      pingLatencyMs: -1,
+      createdAt: Date.now()
+    };
+  }
+
   private static parseVmessJsonBase64Format(base64Content: string): ServerProfile {
     const decodedJson = this.decodeFlexibleBase64(base64Content);
     const json = JSON.parse(decodedJson);
@@ -175,10 +295,16 @@ export class VmessLinkParser {
     const network = (String(json.net || 'tcp').trim().toLowerCase() || 'tcp') as 'tcp' | 'ws' | 'grpc' | 'h2';
     const headerType = String(json.type || 'none').trim().toLowerCase();
     const host = String(json.host || '').trim();
-    const path = String(json.path || '/').trim() || '/';
+    let path = String(json.path || '/').trim() || '/';
+    if (!path.startsWith('/')) {
+      path = `/${path}`;
+    }
     const tls = String(json.tls || '').trim().toLowerCase();
     const sni = String(json.sni || host || address).trim();
     const alpn = String(json.alpn || '').trim();
+    const fp = String(json.fp || '').trim();
+    const pcs = String(json.pcs || json.pinnedPeerCertSha256 || '').trim();
+    const vcn = String(json.vcn || json.verifyPeerCertByName || '').trim();
 
     if (!address) throw new Error("Server address 'add' is missing");
     if (!uuid) throw new Error("Server UUID 'id' is missing");
@@ -203,11 +329,12 @@ export class VmessLinkParser {
       flow: '',
       publicKey: '',
       shortId: '',
-      fingerprint: '',
+      fingerprint: fp,
       spiderX: '',
       serviceName: '',
       grpcMode: 'gun',
-      allowInsecure: true,
+      pinnedPeerCertSha256: pcs,
+      verifyPeerCertByName: vcn,
       pingLatencyMs: -1,
       createdAt: Date.now()
     };
@@ -233,11 +360,17 @@ export class VmessLinkParser {
     const queryParams = new URLSearchParams(queryPart);
     const remarks = queryParams.get('remarks') || 'VMess Server';
     const network = (queryParams.get('obfs') || queryParams.get('net') || 'tcp').toLowerCase() as 'tcp' | 'ws' | 'grpc' | 'h2';
-    const path = queryParams.get('path') || '/';
+    let path = queryParams.get('path') || '/';
+    if (!path.startsWith('/')) {
+      path = `/${path}`;
+    }
     const host = queryParams.get('obfsParam') || queryParams.get('host') || '';
     const tlsRaw = queryParams.get('tls');
     const tls = (tlsRaw === '1' || tlsRaw === 'tls') ? 'tls' : 'none';
     const sni = queryParams.get('peer') || queryParams.get('sni') || host || address;
+    const pcs = queryParams.get('pcs') || queryParams.get('pinnedPeerCertSha256') || '';
+    const vcn = queryParams.get('vcn') || queryParams.get('verifyPeerCertByName') || '';
+    const fp = queryParams.get('fp') || '';
 
     return {
       id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 12),
@@ -258,21 +391,41 @@ export class VmessLinkParser {
       flow: '',
       publicKey: '',
       shortId: '',
-      fingerprint: '',
+      fingerprint: fp,
       spiderX: '',
       serviceName: '',
       grpcMode: 'gun',
-      allowInsecure: true,
+      pinnedPeerCertSha256: pcs,
+      verifyPeerCertByName: vcn,
       pingLatencyMs: -1,
       createdAt: Date.now()
     };
   }
 
   /**
-   * Converts a ServerProfile into the appropriate vmess:// or vless:// share link.
+   * Converts a ServerProfile into the appropriate share link.
    */
   static toShareLink(profile: ServerProfile): string {
+    if (profile.protocol === 'trojan') {
+      return this.toTrojanLink(profile);
+    }
     return profile.protocol === 'vless' ? this.toVlessLink(profile) : this.toVmessLink(profile);
+  }
+
+  static toTrojanLink(profile: ServerProfile): string {
+    const encodedName = encodeURIComponent(profile.name || 'Trojan Node');
+    let link = `trojan://${encodeURIComponent(profile.uuid)}@${profile.address}:${profile.port}?security=tls&type=${profile.network || 'tcp'}`;
+    if (profile.sni) link += `&sni=${encodeURIComponent(profile.sni)}`;
+    if (profile.fingerprint) link += `&fp=${encodeURIComponent(profile.fingerprint)}`;
+    if (profile.alpn) link += `&alpn=${encodeURIComponent(profile.alpn)}`;
+    if (profile.pinnedPeerCertSha256) link += `&pcs=${encodeURIComponent(profile.pinnedPeerCertSha256)}`;
+    if (profile.verifyPeerCertByName) link += `&vcn=${encodeURIComponent(profile.verifyPeerCertByName)}`;
+    if (profile.network === 'ws') {
+      link += `&path=${encodeURIComponent(profile.path || '/')}`;
+      if (profile.host) link += `&host=${encodeURIComponent(profile.host)}`;
+    }
+    link += `#${encodedName}`;
+    return link;
   }
 
   static toVlessLink(profile: ServerProfile): string {
@@ -284,6 +437,8 @@ export class VmessLinkParser {
     if (profile.host) link += `&host=${encodeURIComponent(profile.host)}`;
     if (profile.sni) link += `&sni=${encodeURIComponent(profile.sni)}`;
     if (profile.alpn) link += `&alpn=${encodeURIComponent(profile.alpn)}`;
+    if (profile.pinnedPeerCertSha256) link += `&pcs=${encodeURIComponent(profile.pinnedPeerCertSha256)}`;
+    if (profile.verifyPeerCertByName) link += `&vcn=${encodeURIComponent(profile.verifyPeerCertByName)}`;
     if (profile.flow && (profile.network === 'tcp' || (profile.network as string) === 'raw')) {
       link += `&flow=${encodeURIComponent(profile.flow)}`;
     }
@@ -298,7 +453,7 @@ export class VmessLinkParser {
   }
 
   static toVmessLink(profile: ServerProfile): string {
-    const json = {
+    const json: Record<string, string> = {
       v: '2',
       ps: profile.name,
       add: profile.address,
@@ -314,6 +469,10 @@ export class VmessLinkParser {
       sni: profile.sni || profile.host || '',
       alpn: profile.alpn || ''
     };
+    if (profile.fingerprint) json.fp = profile.fingerprint;
+    if (profile.pinnedPeerCertSha256) json.pcs = profile.pinnedPeerCertSha256;
+    if (profile.verifyPeerCertByName) json.vcn = profile.verifyPeerCertByName;
+
     const jsonStr = JSON.stringify(json);
     const base64 = typeof Buffer !== 'undefined'
       ? Buffer.from(jsonStr, 'utf8').toString('base64')
@@ -322,8 +481,30 @@ export class VmessLinkParser {
   }
 
   /**
+   * Deeply cleanses any configuration object, recursively purging all deprecated fields
+   * like "allowInsecure" to guarantee 100% startup success on Xray-core 26.x+.
+   */
+  static sanitizeConfig(obj: unknown): unknown {
+    if (Array.isArray(obj)) {
+      return obj.map((item) => this.sanitizeConfig(item));
+    } else if (obj !== null && typeof obj === 'object') {
+      const cleaned: Record<string, unknown> = {};
+      for (const [key, val] of Object.entries(obj as Record<string, unknown>)) {
+        // Strip legacy allowInsecure from all sections
+        if (key === 'allowInsecure') {
+          continue;
+        }
+        cleaned[key] = this.sanitizeConfig(val);
+      }
+      return cleaned;
+    }
+    return obj;
+  }
+
+  /**
    * Generates a complete, compliant V2Ray/Xray JSON configuration for this profile.
-   * Certificate handling rule: ALWAYS set "allowInsecure": true inside tlsSettings.
+   * Certificate handling rule: Modern Xray-core (v26+) migration compliant.
+   * Strips "allowInsecure" completely and applies modern TLS verification standards.
    */
   static toV2RayConfigJson(
     profile: ServerProfile,
@@ -407,34 +588,18 @@ export class VmessLinkParser {
 
     // Proxy Outbound
     const isVless = profile.protocol === 'vless';
+    const isTrojan = profile.protocol === 'trojan';
     const isReality = profile.tls === 'reality' || Boolean(profile.publicKey);
     const isTls = profile.tls === 'tls' || isReality;
 
-    const userObj: Record<string, unknown> = {
-      id: profile.uuid,
-      level: 0
-    };
-
-    if (isVless) {
-      userObj.encryption = 'none';
-      if (profile.flow && (profile.network === 'tcp' || (profile.network as string) === 'raw')) {
-        userObj.flow = profile.flow;
-      }
-    } else {
-      userObj.alterId = profile.alterId || 0;
-      userObj.security = profile.security || 'auto';
-    }
-
-    const serverObj = {
-      address: profile.address,
-      port: profile.port,
-      users: [userObj]
-    };
-
-    // StreamSettings
+    // Modern StreamSettings with keep-alive
     const streamSettings: Record<string, unknown> = {
       network: profile.network || 'tcp',
-      security: isReality ? 'reality' : (isTls ? 'tls' : 'none')
+      security: isReality ? 'reality' : (isTls ? 'tls' : 'none'),
+      sockopt: {
+        tcpKeepAliveInterval: 15,
+        tcpFastOpen: false
+      }
     };
 
     if (isReality) {
@@ -448,21 +613,40 @@ export class VmessLinkParser {
       };
     } else if (isTls) {
       const tlsSettings: Record<string, unknown> = {
-        serverName: profile.sni || profile.address,
-        allowInsecure: true // Crucial: Always true as required!
+        serverName: profile.sni || profile.address
       };
       if (profile.fingerprint) {
         tlsSettings.fingerprint = profile.fingerprint;
       }
       if (profile.alpn) {
-        tlsSettings.alpn = profile.alpn.split(',').map(s => s.trim()).filter(Boolean);
+        tlsSettings.alpn = profile.alpn.split(',').map((s) => s.trim()).filter(Boolean);
       }
+      // Modern Xray-core 26+ certification pinning and verification
+      if (profile.pinnedPeerCertSha256) {
+        tlsSettings.pinnedPeerCertSha256 = profile.pinnedPeerCertSha256
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean);
+      }
+      if (profile.verifyPeerCertByName) {
+        tlsSettings.verifyPeerCertByName = profile.verifyPeerCertByName
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean);
+      }
+      // Note: "allowInsecure" is strictly omitted. Xray-core (v26+) errors immediately if present:
+      // "The feature allowInsecure has been removed and migrated to pinnedPeerCertSha256(pcs) and verifyPeerCertByName(vcn)."
       streamSettings.tlsSettings = tlsSettings;
     }
 
     if (profile.network === 'ws') {
+      let wsPath = profile.path || '/';
+      if (!wsPath.startsWith('/')) {
+        wsPath = `/${wsPath}`;
+      }
       const wsSettings: Record<string, unknown> = {
-        path: profile.path || '/'
+        path: wsPath,
+        maxEarlyData: 0
       };
       if (profile.host) {
         wsSettings.headers = { Host: profile.host };
@@ -487,14 +671,53 @@ export class VmessLinkParser {
       };
     }
 
-    const proxyOutbound = {
-      tag: 'proxy',
-      protocol: isVless ? 'vless' : 'vmess',
-      settings: {
-        vnext: [serverObj]
-      },
-      streamSettings
-    };
+    let proxyOutbound: Record<string, unknown>;
+    if (isTrojan) {
+      proxyOutbound = {
+        tag: 'proxy',
+        protocol: 'trojan',
+        settings: {
+          servers: [
+            {
+              address: profile.address,
+              port: profile.port,
+              password: profile.uuid
+            }
+          ]
+        },
+        streamSettings
+      };
+    } else {
+      const userObj: Record<string, unknown> = {
+        id: profile.uuid,
+        level: 0
+      };
+
+      if (isVless) {
+        userObj.encryption = 'none';
+        if (profile.flow && (profile.network === 'tcp' || (profile.network as string) === 'raw')) {
+          userObj.flow = profile.flow;
+        }
+      } else {
+        userObj.alterId = profile.alterId || 0;
+        userObj.security = profile.security || 'auto';
+      }
+
+      const serverObj = {
+        address: profile.address,
+        port: profile.port,
+        users: [userObj]
+      };
+
+      proxyOutbound = {
+        tag: 'proxy',
+        protocol: isVless ? 'vless' : 'vmess',
+        settings: {
+          vnext: [serverObj]
+        },
+        streamSettings
+      };
+    }
     outbounds.push(proxyOutbound);
 
     // Direct outbound
@@ -529,7 +752,6 @@ export class VmessLinkParser {
 
     // 4a. Ad-blocking rule if domains exist
     if (blockedDomains.length > 0) {
-      // Chunk or pass domains
       const domainRules: string[] = [];
       for (const d of blockedDomains) {
         domainRules.push(`domain:${d}`);
@@ -585,11 +807,12 @@ export class VmessLinkParser {
       servers: [primaryDns, secondaryDns, 'localhost']
     };
 
-    return JSON.stringify(root, null, 2);
+    return JSON.stringify(this.sanitizeConfig(root), null, 2);
   }
 
   private static decodeFlexibleBase64(input: string): string {
-    let sanitized = input.trim()
+    let sanitized = input
+      .trim()
       .replace(/-/g, '+')
       .replace(/_/g, '/')
       .replace(/[\r\n\s]/g, '');
