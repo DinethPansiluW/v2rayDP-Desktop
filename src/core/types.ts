@@ -76,9 +76,6 @@ export interface FallbackRule {
 
 export interface AutomationSettings {
   isAutomationGloballyEnabled: boolean;
-  startOnLaunch: boolean;
-  startMinimizedToTray: boolean;
-  startWithWindows: boolean;
 
   // SSID -> Profile Rules
   rules: SsidRule[];

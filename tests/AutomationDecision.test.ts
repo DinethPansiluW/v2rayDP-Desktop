@@ -5,9 +5,6 @@ import { AutomationSettings, WifiStatus } from '../src/core/types';
 describe('AutomationDecision Engine - SSID Rules & Policies', () => {
   const baseSettings: AutomationSettings = {
     isAutomationGloballyEnabled: true,
-    startOnLaunch: false,
-    startMinimizedToTray: false,
-    startWithWindows: false,
     rules: [
       {
         id: 'rule-home',

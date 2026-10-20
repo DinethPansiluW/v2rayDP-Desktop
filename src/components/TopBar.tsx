@@ -1,6 +1,7 @@
 import React from 'react';
 import { ConnectionState } from '../core/types';
 import { Activity, ShieldCheck, Wifi, Radio, Sliders, Info, Zap } from 'lucide-react';
+import logo from '../assets/logo.png';
 
 export type ActiveTab = 'dashboard' | 'automation' | 'hotspot' | 'blocking' | 'settings' | 'about';
 
@@ -37,7 +38,7 @@ export const TopBar: React.FC<TopBarProps> = ({
       {/* Brand & Logo */}
       <div className="flex items-center space-x-3 cursor-pointer" onClick={() => onTabChange('dashboard')}>
         <div className="relative w-9 h-9 rounded-full bg-slate-900 border-2 border-cyan-400/80 p-0.5 shadow-lg shadow-cyan-500/20 flex items-center justify-center overflow-hidden">
-          <img src="/app_logo.png" alt="v2rayDP Logo" className="w-full h-full object-contain rounded-full" />
+          <img src={logo} alt="v2rayDP Logo" className="w-full h-full object-contain rounded-full" />
         </div>
         <div>
           <div className="flex items-center space-x-2">

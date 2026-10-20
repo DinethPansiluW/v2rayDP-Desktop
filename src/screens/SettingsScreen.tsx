@@ -40,6 +40,8 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   const [minimizeToTray, setMinimizeToTray] = useState(settings.minimizeToTray !== false);
   const [closeToTray, setCloseToTray] = useState(settings.closeToTray !== false);
   const [startWithWindows, setStartWithWindows] = useState(Boolean(settings.startWithWindows));
+  const [startMinimized, setStartMinimized] = useState(Boolean(settings.startMinimized));
+  const [autoConnectOnLaunch, setAutoConnectOnLaunch] = useState(Boolean(settings.autoConnectOnLaunch));
 
   const [savedNotice, setSavedNotice] = useState(false);
   const [importNotice, setImportNotice] = useState<string | null>(null);
@@ -58,7 +60,9 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
       logLevel,
       minimizeToTray,
       closeToTray,
-      startWithWindows
+      startWithWindows,
+      startMinimized,
+      autoConnectOnLaunch
     });
     setSavedNotice(true);
     setTimeout(() => setSavedNotice(false), 2500);
@@ -276,6 +280,57 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
           </h3>
 
           <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h4 className="text-sm font-semibold text-slate-200">Start with Windows</h4>
+                <p className="text-xs text-slate-400">
+                  Launches v2rayDP Desktop automatically on Windows login (app.setLoginItemSettings)
+                </p>
+              </div>
+              <input
+                type="checkbox"
+                checked={startWithWindows}
+                onChange={(e) => setStartWithWindows(e.target.checked)}
+                className="w-4 h-4 accent-cyan-400 cursor-pointer"
+              />
+            </div>
+
+            <div className="h-px bg-slate-800" />
+
+            <div className="flex items-center justify-between">
+              <div>
+                <h4 className="text-sm font-semibold text-slate-200">Start Minimized to System Tray</h4>
+                <p className="text-xs text-slate-400">
+                  Starts application directly in background system tray without showing main window
+                </p>
+              </div>
+              <input
+                type="checkbox"
+                checked={startMinimized}
+                onChange={(e) => setStartMinimized(e.target.checked)}
+                className="w-4 h-4 accent-cyan-400 cursor-pointer"
+              />
+            </div>
+
+            <div className="h-px bg-slate-800" />
+
+            <div className="flex items-center justify-between">
+              <div>
+                <h4 className="text-sm font-semibold text-slate-200">Auto-Connect on App Launch</h4>
+                <p className="text-xs text-slate-400">
+                  Automatically establishes proxy connection on application startup
+                </p>
+              </div>
+              <input
+                type="checkbox"
+                checked={autoConnectOnLaunch}
+                onChange={(e) => setAutoConnectOnLaunch(e.target.checked)}
+                className="w-4 h-4 accent-cyan-400 cursor-pointer"
+              />
+            </div>
+
+            <div className="h-px bg-slate-800" />
+
             <div className="flex items-center justify-between">
               <div>
                 <h4 className="text-sm font-semibold text-slate-200">Minimize to System Tray</h4>

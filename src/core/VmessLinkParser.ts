@@ -354,8 +354,21 @@ export class VmessLinkParser {
       loglevel: logLevel === 'none' ? 'error' : logLevel
     };
 
+    // 1b. Stats & API Service for real-time traffic statistics
+    root.stats = {};
+    root.api = {
+      tag: 'api',
+      services: ['StatsService']
+    };
+    root.policy = {
+      system: {
+        statsOutboundUplink: true,
+        statsOutboundDownlink: true
+      }
+    };
+
     // 2. Inbounds
-    const inbounds = [
+    const inbounds: Record<string, unknown>[] = [
       {
         tag: 'socks-in',
         port: socksPort,
@@ -376,6 +389,15 @@ export class VmessLinkParser {
         listen: listenHost,
         protocol: 'http',
         settings: {}
+      },
+      {
+        tag: 'api',
+        port: 10085,
+        listen: '127.0.0.1',
+        protocol: 'dokodemo-door',
+        settings: {
+          address: '127.0.0.1'
+        }
       }
     ];
     root.inbounds = inbounds;
@@ -497,6 +519,13 @@ export class VmessLinkParser {
 
     // 4. Routing
     const rules: Record<string, unknown>[] = [];
+
+    // 4-api. Route internal StatsService API traffic
+    rules.push({
+      type: 'field',
+      inboundTag: ['api'],
+      outboundTag: 'api'
+    });
 
     // 4a. Ad-blocking rule if domains exist
     if (blockedDomains.length > 0) {

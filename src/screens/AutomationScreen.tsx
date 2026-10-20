@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { AutomationSettings, WifiStatus, ServerProfile, SsidRule } from '../core/types';
+import { AutomationSettings, WifiStatus, ServerProfile, SsidRule, DesktopSettings } from '../core/types';
 import {
   Wifi,
   WifiOff,
@@ -23,17 +23,21 @@ import {
 
 interface AutomationScreenProps {
   settings: AutomationSettings;
+  desktopSettings: DesktopSettings;
   wifiStatus: WifiStatus;
   profiles: ServerProfile[];
   onSaveSettings: (settings: AutomationSettings) => Promise<boolean>;
+  onSaveDesktopSettings: (settings: DesktopSettings) => Promise<boolean>;
   onResetManualOverride: () => Promise<void>;
 }
 
 export const AutomationScreen: React.FC<AutomationScreenProps> = ({
   settings,
+  desktopSettings,
   wifiStatus,
   profiles,
   onSaveSettings,
+  onSaveDesktopSettings,
   onResetManualOverride
 }) => {
   const [showAddModal, setShowAddModal] = useState(false);
@@ -575,8 +579,8 @@ export const AutomationScreen: React.FC<AutomationScreenProps> = ({
             </div>
             <input
               type="checkbox"
-              checked={settings.startWithWindows}
-              onChange={(e) => handleUpdate({ startWithWindows: e.target.checked })}
+              checked={desktopSettings.startWithWindows}
+              onChange={(e) => onSaveDesktopSettings({ ...desktopSettings, startWithWindows: e.target.checked })}
               className="w-4 h-4 accent-cyan-400 cursor-pointer"
             />
           </div>
@@ -592,8 +596,8 @@ export const AutomationScreen: React.FC<AutomationScreenProps> = ({
             </div>
             <input
               type="checkbox"
-              checked={settings.startMinimizedToTray}
-              onChange={(e) => handleUpdate({ startMinimizedToTray: e.target.checked })}
+              checked={desktopSettings.startMinimized}
+              onChange={(e) => onSaveDesktopSettings({ ...desktopSettings, startMinimized: e.target.checked })}
               className="w-4 h-4 accent-cyan-400 cursor-pointer"
             />
           </div>
@@ -609,8 +613,8 @@ export const AutomationScreen: React.FC<AutomationScreenProps> = ({
             </div>
             <input
               type="checkbox"
-              checked={settings.startOnLaunch}
-              onChange={(e) => handleUpdate({ startOnLaunch: e.target.checked })}
+              checked={desktopSettings.autoConnectOnLaunch}
+              onChange={(e) => onSaveDesktopSettings({ ...desktopSettings, autoConnectOnLaunch: e.target.checked })}
               className="w-4 h-4 accent-cyan-400 cursor-pointer"
             />
           </div>

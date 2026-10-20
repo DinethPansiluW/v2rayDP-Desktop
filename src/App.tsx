@@ -40,9 +40,6 @@ export default function App() {
   });
   const [automationSettings, setAutomationSettings] = useState<AutomationSettings>({
     isAutomationGloballyEnabled: true,
-    startOnLaunch: false,
-    startMinimizedToTray: false,
-    startWithWindows: false,
     rules: [
       {
         id: 'rule-home-office',
@@ -321,6 +318,7 @@ export default function App() {
         {activeTab === 'automation' && (
           <AutomationScreen
             settings={automationSettings}
+            desktopSettings={desktopSettings}
             wifiStatus={wifiStatus}
             profiles={profiles}
             onSaveSettings={async (newSettings) => {
@@ -328,6 +326,13 @@ export default function App() {
               const ok = await window.api.saveAutomationSettings(newSettings);
               setAutomationSettings(newSettings);
               showToast('Automation settings saved', 'success');
+              return ok;
+            }}
+            onSaveDesktopSettings={async (newSettings) => {
+              if (!window.api) return false;
+              const ok = await window.api.saveDesktopSettings(newSettings);
+              setDesktopSettings(newSettings);
+              showToast('Startup settings saved', 'success');
               return ok;
             }}
             onResetManualOverride={async () => {

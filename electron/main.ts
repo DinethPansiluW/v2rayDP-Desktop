@@ -4,15 +4,17 @@
  * - Single-instance lock
  * - Window lifecycle, minimize/close to tray
  * - System Tray with dynamic Connect/Disconnect/Open/Exit menu
- * - Windows System Proxy management via Registry (HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings)
- *   with WinINet notification and guaranteed restore on disconnect/quit/crash
- * - Xray-core binary lifecycle (spawns resources/bin/xray.exe, config.json generation)
+ * - Windows System Proxy management via Registry
+ *   (HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings)
+ *   with PowerShell WinINet notification and guaranteed restore on disconnect/quit/crash
+ * - Xray-core binary lifecycle with real-time statsquery API, SOCKS port readiness check,
+ *   mutual exclusion, and config.json generation
  * - Wi-Fi monitoring via `netsh wlan show interfaces`
  * - TCP/TLS latency tester with allowInsecure: true
  * - JSON persistence in app.getPath('userData')
  */
 
-import { app, BrowserWindow, Tray, Menu, ipcMain, shell } from 'electron';
+import { app, BrowserWindow, Tray, Menu, ipcMain, shell, nativeImage } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -33,6 +35,7 @@ import {
 import { VmessLinkParser } from '../src/core/VmessLinkParser';
 import { AutomationDecision } from '../src/core/AutomationDecision';
 import { BlockManager } from '../src/core/BlockManager';
+import defaultSources from '../src/assets/blocklist_sources.json';
 
 // Single Instance Lock
 const gotTheLock = app.requestSingleInstanceLock();
@@ -42,22 +45,23 @@ if (!gotTheLock) {
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
-let xrayProcess: ChildProcess | null = null;
+let currentXrayChild: ChildProcess | null = null;
+let isStoppingIntentionally = false;
 let isQuitting = false;
+let cleanedUp = false;
 
-// Config store file
+// Config store files in userData
 const userDataPath = app.getPath('userData');
 const storeFilePath = path.join(userDataPath, 'v2raydp_config.json');
 const xrayConfigPath = path.join(userDataPath, 'config.json');
-const xrayLogPath = path.join(userDataPath, 'xray_access.log');
+const proxyBackupPath = path.join(userDataPath, 'proxy_backup.json');
+const blocklistsDir = path.join(userDataPath, 'blocklists');
 
 interface SavedOriginalProxy {
   proxyEnable: number;
   proxyServer: string;
   proxyOverride: string;
 }
-
-let savedOriginalProxy: SavedOriginalProxy | null = null;
 
 interface AppStore {
   profiles: ServerProfile[];
@@ -72,7 +76,53 @@ function loadStore(): AppStore {
   try {
     if (fs.existsSync(storeFilePath)) {
       const data = fs.readFileSync(storeFilePath, 'utf8');
-      return JSON.parse(data);
+      const parsed = JSON.parse(data);
+      return {
+        profiles: parsed.profiles || [],
+        automation: {
+          isAutomationGloballyEnabled: parsed.automation?.isAutomationGloballyEnabled ?? true,
+          rules: parsed.automation?.rules || [],
+          fallbackRule: parsed.automation?.fallbackRule || {
+            enabled: true,
+            action: 'connect',
+            profileId: null
+          },
+          autoStopOnWifiLeave: parsed.automation?.autoStopOnWifiLeave ?? true,
+          wifiLeavePolicy: parsed.automation?.wifiLeavePolicy || 'STOP_VPN',
+          autoStopOnWifiOff: parsed.automation?.autoStopOnWifiOff ?? true,
+          autoReconnectOnWifiReturn: parsed.automation?.autoReconnectOnWifiReturn ?? true,
+          manualOverrideSuppressed: parsed.automation?.manualOverrideSuppressed || false,
+          manualOverrideReason: parsed.automation?.manualOverrideReason || '',
+          manualOverrideNetworkKey: parsed.automation?.manualOverrideNetworkKey || null,
+          manualConnectedProfileId: parsed.automation?.manualConnectedProfileId || null,
+          manualConnectedNetworkKey: parsed.automation?.manualConnectedNetworkKey || null,
+          stoppedByLeaveWifiSsid: parsed.automation?.stoppedByLeaveWifiSsid || null
+        },
+        hotspot: {
+          isHotspotSharingEnabled: parsed.hotspot?.isHotspotSharingEnabled || false,
+          hotspotProxyPort: parsed.hotspot?.hotspotProxyPort || 10808,
+          httpProxyPort: parsed.hotspot?.httpProxyPort || 10809,
+          requireAuth: parsed.hotspot?.requireAuth || false,
+          username: parsed.hotspot?.username,
+          password: parsed.hotspot?.password
+        },
+        block: parsed.block || BlockManager.getDefaultSettings(),
+        settings: {
+          mode: parsed.settings?.mode || 'system_proxy',
+          socksPort: parsed.settings?.socksPort || 10808,
+          httpPort: parsed.settings?.httpPort || 10809,
+          primaryDns: parsed.settings?.primaryDns || '1.1.1.1',
+          secondaryDns: parsed.settings?.secondaryDns || '8.8.8.8',
+          isBypassLan: parsed.settings?.isBypassLan !== false,
+          logLevel: parsed.settings?.logLevel || 'warning',
+          minimizeToTray: parsed.settings?.minimizeToTray !== false,
+          closeToTray: parsed.settings?.closeToTray !== false,
+          startWithWindows: parsed.settings?.startWithWindows || false,
+          startMinimized: parsed.settings?.startMinimized || false,
+          autoConnectOnLaunch: parsed.settings?.autoConnectOnLaunch || false
+        },
+        logs: parsed.logs || []
+      };
     }
   } catch (err) {
     console.error('Failed to load store file:', err);
@@ -82,9 +132,6 @@ function loadStore(): AppStore {
     profiles: [],
     automation: {
       isAutomationGloballyEnabled: true,
-      startOnLaunch: false,
-      startMinimizedToTray: false,
-      startWithWindows: false,
       rules: [],
       fallbackRule: {
         enabled: true,
@@ -153,6 +200,8 @@ let trafficStats: TrafficStats = {
 };
 
 let connectStartTime = 0;
+let prevStatsUplink = 0;
+let prevStatsDownlink = 0;
 let trafficTimer: NodeJS.Timeout | null = null;
 let wifiPollTimer: NodeJS.Timeout | null = null;
 let currentWifiStatus: WifiStatus = {
@@ -202,19 +251,21 @@ class WindowsProxyManager {
     });
   }
 
-  static async setSystemProxy(httpPort: number, socksPort: number, bypassLan: boolean): Promise<void> {
+  static async setSystemProxy(httpPort: number, bypassLan: boolean): Promise<void> {
     if (process.platform !== 'win32') {
       addLog('WARN', 'Proxy', 'System proxy configuration only supported on Windows platform');
       return;
     }
 
     try {
-      if (!savedOriginalProxy) {
-        savedOriginalProxy = await this.readCurrentProxy();
-        addLog('INFO', 'Proxy', `Backed up previous Windows proxy settings (Enabled: ${savedOriginalProxy.proxyEnable})`);
+      // Persist backup to proxy_backup.json if not already backed up
+      if (!fs.existsSync(proxyBackupPath)) {
+        const current = await this.readCurrentProxy();
+        fs.writeFileSync(proxyBackupPath, JSON.stringify(current, null, 2), 'utf8');
+        addLog('INFO', 'Proxy', `Backed up original Windows proxy settings (Enabled: ${current.proxyEnable})`);
       }
 
-      const proxyServer = `http=127.0.0.1:${httpPort};https=127.0.0.1:${httpPort};socks=127.0.0.1:${socksPort}`;
+      const proxyServer = `127.0.0.1:${httpPort}`;
       const bypassList = bypassLan
         ? '<local>;localhost;127.*;10.*;192.168.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*'
         : '<local>;localhost;127.*';
@@ -230,7 +281,7 @@ class WindowsProxyManager {
       }
 
       this.notifyWinINet();
-      addLog('INFO', 'Proxy', `Windows System Proxy set to 127.0.0.1:${httpPort}`);
+      addLog('INFO', 'Proxy', `Windows System Proxy set to ${proxyServer}`);
     } catch (err: unknown) {
       addLog('ERROR', 'Proxy', `Failed to set Windows proxy: ${(err as Error).message}`);
     }
@@ -240,7 +291,13 @@ class WindowsProxyManager {
     if (process.platform !== 'win32') return;
 
     try {
-      const orig = savedOriginalProxy || { proxyEnable: 0, proxyServer: '', proxyOverride: '' };
+      let orig: SavedOriginalProxy = { proxyEnable: 0, proxyServer: '', proxyOverride: '' };
+      if (fs.existsSync(proxyBackupPath)) {
+        try {
+          const raw = fs.readFileSync(proxyBackupPath, 'utf8');
+          orig = JSON.parse(raw);
+        } catch {}
+      }
 
       const commands = [
         `reg add "${this.regKey}" /v ProxyEnable /t REG_DWORD /d ${orig.proxyEnable} /f`,
@@ -253,55 +310,214 @@ class WindowsProxyManager {
       }
 
       this.notifyWinINet();
-      savedOriginalProxy = null;
+
+      if (fs.existsSync(proxyBackupPath)) {
+        try {
+          fs.unlinkSync(proxyBackupPath);
+        } catch {}
+      }
+
       addLog('INFO', 'Proxy', 'Restored original Windows System Proxy settings');
     } catch (err: unknown) {
       addLog('ERROR', 'Proxy', `Failed to restore Windows proxy: ${(err as Error).message}`);
     }
   }
 
-  private static notifyWinINet(): void {
-    // Notify WinINet of registry change via PowerShell / rundll32
-    exec(
-      'powershell -Command "[void][System.Runtime.InteropServices.Marshal]::PrelinkAll(); Add-Type -TypeDefinition \'using System; using System.Runtime.InteropServices; public class WinINet { [DllImport(\\\"wininet.dll\\\", SetLastError = true)] public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int dwBufferLength); }\'; [WinINet]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0); [WinINet]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0);"',
-      () => {}
-    );
+  static notifyWinINet(): void {
+    if (process.platform !== 'win32') return;
+
+    // Use PowerShell with -NoProfile -ExecutionPolicy Bypass -EncodedCommand
+    const script = `
+$code = @"
+using System;
+using System.Runtime.InteropServices;
+public class WinINet {
+    [DllImport("wininet.dll", SetLastError = true)]
+    public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int dwBufferLength);
+}
+"@
+Add-Type -TypeDefinition $code
+[WinINet]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0)
+[WinINet]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0)
+`;
+    const encoded = Buffer.from(script, 'utf16le').toString('base64');
+    exec(`powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${encoded}`, () => {});
   }
 }
 
 // ==========================================
-// Xray-Core Process Execution
+// Path Resolution (Never use __dirname)
 // ==========================================
 function getXrayExecutablePath(): string {
-  const isDev = !app.isPackaged;
-  if (isDev) {
-    const devPath = path.join(__dirname, '..', 'resources', 'bin', 'xray.exe');
-    if (fs.existsSync(devPath)) return devPath;
+  if (app.isPackaged) {
+    const resPath = process.resourcesPath || path.join(app.getAppPath(), '..');
+    return path.join(resPath, 'bin', 'xray.exe');
   } else {
-    const prodPath = path.join((process as any).resourcesPath || process.cwd(), 'bin', 'xray.exe');
-    if (fs.existsSync(prodPath)) return prodPath;
+    return path.join(app.getAppPath(), 'resources', 'bin', 'xray.exe');
   }
-  return path.join(userDataPath, 'xray.exe');
 }
 
-async function startXray(profile: ServerProfile): Promise<boolean> {
-  stopXray();
+function getAppIconPath(): string {
+  if (app.isPackaged) {
+    return path.join(app.getAppPath(), 'dist', 'app_logo.png');
+  } else {
+    return path.join(app.getAppPath(), 'public', 'app_logo.png');
+  }
+}
+
+// ==========================================
+// Process Serialization & Mutex
+// ==========================================
+let operationMutex: Promise<any> = Promise.resolve();
+
+function runSerialized<T>(fn: () => Promise<T>): Promise<T> {
+  const result = operationMutex.then(() => fn());
+  operationMutex = result.catch(() => {});
+  return result;
+}
+
+function waitForPort(port: number, timeoutMs = 8000): Promise<boolean> {
+  const start = Date.now();
+  return new Promise((resolve) => {
+    const check = () => {
+      const socket = new net.Socket();
+      socket.setTimeout(400);
+
+      socket.once('connect', () => {
+        socket.destroy();
+        resolve(true);
+      });
+
+      socket.once('error', () => {
+        socket.destroy();
+        if (Date.now() - start >= timeoutMs) {
+          resolve(false);
+        } else {
+          setTimeout(check, 250);
+        }
+      });
+
+      socket.once('timeout', () => {
+        socket.destroy();
+        if (Date.now() - start >= timeoutMs) {
+          resolve(false);
+        } else {
+          setTimeout(check, 250);
+        }
+      });
+
+      socket.connect(port, '127.0.0.1');
+    };
+
+    check();
+  });
+}
+
+async function stopCurrentXrayProcess(): Promise<void> {
+  if (!currentXrayChild) return;
+
+  const childToKill = currentXrayChild;
+  currentXrayChild = null;
+  isStoppingIntentionally = true;
+
+  try {
+    childToKill.kill('SIGKILL');
+  } catch {}
+
+  // Await exit
+  await new Promise<void>((resolve) => {
+    let resolved = false;
+    const done = () => {
+      if (!resolved) {
+        resolved = true;
+        resolve();
+      }
+    };
+
+    childToKill.once('exit', done);
+    setTimeout(done, 1500);
+  });
+
+  isStoppingIntentionally = false;
+}
+
+// Gather all active blocked domains from cache & custom rules
+function getActiveBlockedDomains(): string[] {
+  const block = store.block;
+  if (!block.isBlockingEnabled) return [];
+
+  const domains = new Set<string>();
+
+  // Add custom user rules
+  for (const rule of block.customRules || []) {
+    const norm = BlockManager.normalizeCustomRule(rule);
+    if (norm) domains.add(norm);
+  }
+
+  // Add from cached source files
+  if (fs.existsSync(blocklistsDir)) {
+    const enabledSources = (block.sources || []).filter((s) => s.enabled);
+    for (const source of enabledSources) {
+      const filePath = path.join(blocklistsDir, `${source.id}.txt`);
+      if (fs.existsSync(filePath)) {
+        try {
+          const content = fs.readFileSync(filePath, 'utf8');
+          const lines = content.split('\n');
+          for (const line of lines) {
+            const domain = line.trim();
+            if (domain) domains.add(domain);
+          }
+        } catch {}
+      }
+    }
+  }
+
+  return Array.from(domains);
+}
+
+async function startXrayInternal(profile: ServerProfile): Promise<boolean> {
+  await stopCurrentXrayProcess();
+  stopTrafficMonitor();
 
   const binaryPath = getXrayExecutablePath();
   const desktopSettings = store.settings;
   const hotspot = store.hotspot;
-  const block = store.block;
+  const socksPort = desktopSettings.socksPort || 10808;
+  const httpPort = desktopSettings.httpPort || 10809;
 
-  // Gather blocked domains if ad-blocking is enabled
-  let activeBlockedDomains: string[] = [];
-  if (block.isBlockingEnabled) {
-    activeBlockedDomains = [...block.customRules];
-    // In production, also includes merged hosts cached in userData
+  // B5: Check if binary exists. If missing, report error and do not touch system proxy
+  if (!fs.existsSync(binaryPath)) {
+    const errorMsg = `xray.exe not found in ${binaryPath}`;
+    addLog('ERROR', 'Xray', errorMsg);
+    currentConnectionState = {
+      status: 'error',
+      reason: errorMsg,
+      activeProfile: null
+    };
+    mainWindow?.webContents.send('on-state-change', currentConnectionState);
+    updateTrayMenu();
+    return false;
   }
 
+  // Stay in 'connecting' until verified
+  currentConnectionState = {
+    status: 'connecting',
+    reason: `Starting Xray with ${profile.name}...`,
+    profileName: profile.name,
+    activeProfile: profile,
+    connectedAt: Date.now(),
+    localSocksPort: socksPort,
+    localHttpPort: httpPort,
+    systemProxyActive: false
+  };
+  mainWindow?.webContents.send('on-state-change', currentConnectionState);
+  updateTrayMenu();
+
+  const activeBlockedDomains = getActiveBlockedDomains();
+
   const xrayJson = VmessLinkParser.toV2RayConfigJson(profile, {
-    socksPort: desktopSettings.socksPort || 10808,
-    httpPort: desktopSettings.httpPort || 10809,
+    socksPort,
+    httpPort,
     listenAllInterfaces: hotspot.isHotspotSharingEnabled,
     bypassLan: desktopSettings.isBypassLan,
     primaryDns: desktopSettings.primaryDns,
@@ -312,109 +528,119 @@ async function startXray(profile: ServerProfile): Promise<boolean> {
 
   fs.writeFileSync(xrayConfigPath, xrayJson, 'utf8');
 
-  return new Promise((resolve) => {
-    if (!fs.existsSync(binaryPath)) {
-      addLog('WARN', 'Xray', `Xray-core binary not found at ${binaryPath}. Running in simulated engine mode.`);
-      // Simulated core mode
+  let lastStderr = '';
+  let earlyExitCode: number | null = null;
+  const binDir = path.dirname(binaryPath);
+
+  try {
+    const child = spawn(binaryPath, ['run', '-c', xrayConfigPath], {
+      cwd: binDir,
+      windowsHide: true,
+      env: {
+        ...process.env,
+        XRAY_LOCATION_ASSET: binDir
+      }
+    });
+    currentXrayChild = child;
+
+    child.stdout?.on('data', (data) => {
+      const text = data.toString().trim();
+      if (text) {
+        addLog('DEBUG', 'XrayCore', text);
+      }
+    });
+
+    child.stderr?.on('data', (data) => {
+      const text = data.toString().trim();
+      if (text) {
+        lastStderr = text;
+        addLog('WARN', 'XrayCore', text);
+      }
+    });
+
+    child.on('error', (err) => {
+      if (child !== currentXrayChild) return;
+      addLog('ERROR', 'Xray', `Process error: ${err.message}`);
+      disconnectVpnInternal(`Xray process crashed: ${err.message}`);
+    });
+
+    child.on('exit', (code, signal) => {
+      earlyExitCode = code;
+      if (child !== currentXrayChild || isStoppingIntentionally) return;
+
+      if (currentConnectionState.status === 'connected') {
+        addLog('WARN', 'Xray', `Xray-core terminated unexpectedly (code: ${code}, signal: ${signal})`);
+        disconnectVpnInternal('Proxy engine stopped unexpectedly');
+      }
+    });
+
+    // Poll SOCKS port for up to 8s
+    const isPortReady = await waitForPort(socksPort, 8000);
+
+    if (!isPortReady || earlyExitCode !== null || child !== currentXrayChild) {
+      const failReason = lastStderr || 'Failed to initialize Xray engine or bind SOCKS port';
+      addLog('ERROR', 'Xray', `Startup failure: ${failReason}`);
+      await stopCurrentXrayProcess();
+
       currentConnectionState = {
-        status: 'connected',
-        profileName: profile.name,
-        activeProfile: profile,
-        connectedAt: Date.now(),
-        localSocksPort: desktopSettings.socksPort,
-        localHttpPort: desktopSettings.httpPort,
-        systemProxyActive: true
+        status: 'error',
+        reason: failReason,
+        activeProfile: null
       };
       mainWindow?.webContents.send('on-state-change', currentConnectionState);
       updateTrayMenu();
-      startTrafficMonitor();
-      resolve(true);
-      return;
+      return false;
     }
 
-    try {
-      xrayProcess = spawn(binaryPath, ['run', '-c', xrayConfigPath], {
-        cwd: path.dirname(binaryPath),
-        windowsHide: true
-      });
+    // Port is ready! Now activate Windows System Proxy
+    await WindowsProxyManager.setSystemProxy(httpPort, desktopSettings.isBypassLan);
 
-      xrayProcess.stdout?.on('data', (data) => {
-        const text = data.toString().trim();
-        if (text) {
-          addLog('DEBUG', 'XrayCore', text);
-          if (text.includes('[block]') || text.includes('blackhole')) {
-            store.block.sessionBlockedCount = (store.block.sessionBlockedCount || 0) + 1;
-            store.block.totalBlockedCount = (store.block.totalBlockedCount || 0) + 1;
-            saveStore();
-          }
-        }
-      });
+    connectStartTime = Date.now();
+    prevStatsUplink = 0;
+    prevStatsDownlink = 0;
+    trafficStats = {
+      uploadSpeedBps: 0,
+      downloadSpeedBps: 0,
+      sessionTxBytes: 0,
+      sessionRxBytes: 0,
+      connectedDurationSeconds: 0
+    };
 
-      xrayProcess.stderr?.on('data', (data) => {
-        const text = data.toString().trim();
-        if (text) addLog('WARN', 'XrayCore', text);
-      });
+    currentConnectionState = {
+      status: 'connected',
+      reason: 'Connected',
+      profileName: profile.name,
+      activeProfile: profile,
+      connectedAt: connectStartTime,
+      localSocksPort: socksPort,
+      localHttpPort: httpPort,
+      systemProxyActive: true
+    };
 
-      xrayProcess.on('error', (err) => {
-        addLog('ERROR', 'Xray', `Process error: ${err.message}`);
-        disconnectVpn(`Xray process crashed: ${err.message}`);
-      });
-
-      xrayProcess.on('exit', (code, signal) => {
-        if (currentConnectionState.status === 'connected') {
-          addLog('WARN', 'Xray', `Xray-core terminated unexpectedly (code: ${code}, signal: ${signal})`);
-          disconnectVpn('Proxy engine stopped');
-        }
-      });
-
-      // Enable Windows system proxy
-      WindowsProxyManager.setSystemProxy(
-        desktopSettings.httpPort,
-        desktopSettings.socksPort,
-        desktopSettings.isBypassLan
-      );
-
-      connectStartTime = Date.now();
-      currentConnectionState = {
-        status: 'connected',
-        profileName: profile.name,
-        activeProfile: profile,
-        connectedAt: connectStartTime,
-        localSocksPort: desktopSettings.socksPort,
-        localHttpPort: desktopSettings.httpPort,
-        systemProxyActive: true
-      };
-
-      mainWindow?.webContents.send('on-state-change', currentConnectionState);
-      updateTrayMenu();
-      startTrafficMonitor();
-      addLog('INFO', 'Core', `Xray proxy active for ${profile.name}`);
-      resolve(true);
-    } catch (err: unknown) {
-      addLog('ERROR', 'Xray', `Failed to spawn xray.exe: ${(err as Error).message}`);
-      disconnectVpn('Failed to launch Xray process');
-      resolve(false);
-    }
-  });
-}
-
-function stopXray(): void {
-  if (xrayProcess) {
-    try {
-      xrayProcess.kill('SIGKILL');
-    } catch {}
-    xrayProcess = null;
+    mainWindow?.webContents.send('on-state-change', currentConnectionState);
+    mainWindow?.webContents.send('on-traffic-stats', trafficStats);
+    updateTrayMenu();
+    startRealTrafficMonitor(binaryPath);
+    addLog('INFO', 'Core', `Xray proxy active for "${profile.name}" on SOCKS :${socksPort} & HTTP :${httpPort}`);
+    return true;
+  } catch (err: unknown) {
+    const errorMsg = (err as Error).message;
+    addLog('ERROR', 'Xray', `Failed to spawn xray.exe: ${errorMsg}`);
+    currentConnectionState = {
+      status: 'error',
+      reason: errorMsg,
+      activeProfile: null
+    };
+    mainWindow?.webContents.send('on-state-change', currentConnectionState);
+    updateTrayMenu();
+    return false;
   }
 }
 
-async function disconnectVpn(reason = 'Disconnected'): Promise<void> {
-  stopXray();
+async function disconnectVpnInternal(reason = 'Disconnected'): Promise<void> {
+  stopTrafficMonitor();
+  await stopCurrentXrayProcess();
   await WindowsProxyManager.restoreSystemProxy();
-
-  if (trafficTimer) {
-    clearInterval(trafficTimer);
-    trafficTimer = null;
-  }
 
   currentConnectionState = {
     status: 'disconnected',
@@ -436,24 +662,77 @@ async function disconnectVpn(reason = 'Disconnected'): Promise<void> {
   addLog('INFO', 'Core', `Disconnected: ${reason}`);
 }
 
-function startTrafficMonitor() {
-  if (trafficTimer) clearInterval(trafficTimer);
+function startXray(profile: ServerProfile): Promise<boolean> {
+  return runSerialized(() => startXrayInternal(profile));
+}
+
+function disconnectVpn(reason = 'Disconnected'): Promise<void> {
+  return runSerialized(() => disconnectVpnInternal(reason));
+}
+
+// B4: Helper to restart Xray with the currently RUNNING profile
+async function restartRunningXrayIfActive(): Promise<void> {
+  if (currentConnectionState.status === 'connected' && currentConnectionState.activeProfile) {
+    await startXray(currentConnectionState.activeProfile);
+  }
+}
+
+// ==========================================
+// Real Traffic Monitor via statsquery (B6)
+// ==========================================
+function stopTrafficMonitor(): void {
+  if (trafficTimer) {
+    clearInterval(trafficTimer);
+    trafficTimer = null;
+  }
+}
+
+function startRealTrafficMonitor(binaryPath: string): void {
+  stopTrafficMonitor();
+
   trafficTimer = setInterval(() => {
-    if (currentConnectionState.status !== 'connected') return;
+    if (currentConnectionState.status !== 'connected' || !currentXrayChild) return;
 
-    const duration = Math.floor((Date.now() - connectStartTime) / 1000);
-    const upSpeed = Math.floor(120000 + Math.random() * 450000);
-    const downSpeed = Math.floor(950000 + Math.random() * 2800000);
+    const binDir = path.dirname(binaryPath);
+    const cmd = `"${binaryPath}" api statsquery --server=127.0.0.1:10085`;
 
-    trafficStats = {
-      uploadSpeedBps: upSpeed,
-      downloadSpeedBps: downSpeed,
-      sessionTxBytes: trafficStats.sessionTxBytes + upSpeed,
-      sessionRxBytes: trafficStats.sessionRxBytes + downSpeed,
-      connectedDurationSeconds: duration
-    };
+    exec(cmd, { cwd: binDir }, (err, stdout) => {
+      if (err || !stdout) return;
 
-    mainWindow?.webContents.send('on-traffic-stats', trafficStats);
+      try {
+        const data = JSON.parse(stdout);
+        const statsArray: Array<{ name: string; value?: number }> = data.stat || [];
+
+        let currentUplink = 0;
+        let currentDownlink = 0;
+
+        for (const item of statsArray) {
+          if (item.name === 'outbound>>>proxy>>>traffic>>>uplink') {
+            currentUplink = Number(item.value) || 0;
+          } else if (item.name === 'outbound>>>proxy>>>traffic>>>downlink') {
+            currentDownlink = Number(item.value) || 0;
+          }
+        }
+
+        const deltaUp = prevStatsUplink > 0 ? Math.max(0, currentUplink - prevStatsUplink) : 0;
+        const deltaDown = prevStatsDownlink > 0 ? Math.max(0, currentDownlink - prevStatsDownlink) : 0;
+
+        prevStatsUplink = currentUplink;
+        prevStatsDownlink = currentDownlink;
+
+        const duration = Math.floor((Date.now() - connectStartTime) / 1000);
+
+        trafficStats = {
+          uploadSpeedBps: deltaUp,
+          downloadSpeedBps: deltaDown,
+          sessionTxBytes: currentUplink,
+          sessionRxBytes: currentDownlink,
+          connectedDurationSeconds: duration
+        };
+
+        mainWindow?.webContents.send('on-traffic-stats', trafficStats);
+      } catch {}
+    });
   }, 1000);
 }
 
@@ -499,15 +778,22 @@ function pollWifiState(): Promise<WifiStatus> {
   });
 }
 
+function stopWifiAutomationMonitor(): void {
+  if (wifiPollTimer) {
+    clearInterval(wifiPollTimer);
+    wifiPollTimer = null;
+  }
+}
+
 function startWifiAutomationMonitor() {
-  if (wifiPollTimer) clearInterval(wifiPollTimer);
+  stopWifiAutomationMonitor();
 
   wifiPollTimer = setInterval(async () => {
     const newStatus = await pollWifiState();
     currentWifiStatus = newStatus;
     mainWindow?.webContents.send('on-wifi-status', newStatus);
 
-    // Evaluate automation
+    // Evaluate pure decision logic
     const decision = AutomationDecision.evaluate({
       settings: store.automation,
       wifiStatus: newStatus,
@@ -528,7 +814,7 @@ function startWifiAutomationMonitor() {
 
     if (decision.action.type === 'START_VPN' || decision.action.type === 'SWITCH_VPN') {
       const action = decision.action as { type: string; profileId: string; reason: string };
-      const target = store.profiles.find(p => p.id === action.profileId);
+      const target = store.profiles.find((p) => p.id === action.profileId);
       if (target) {
         addLog(
           'AUTO',
@@ -570,15 +856,18 @@ async function testServerLatency(profile: ServerProfile): Promise<number> {
 
     socket.connect(profile.port, profile.address, () => {
       if (profile.tls === 'tls' || profile.tls === 'reality') {
-        const tlsSocket = tls.connect({
-          socket,
-          servername: profile.sni || profile.address,
-          rejectUnauthorized: false // Port PingTester.kt trust-all SSLSocketFactory!
-        }, () => {
-          const elapsed = Date.now() - start;
-          tlsSocket.destroy();
-          onFinish(elapsed);
-        });
+        const tlsSocket = tls.connect(
+          {
+            socket,
+            servername: profile.sni || profile.address,
+            rejectUnauthorized: false
+          },
+          () => {
+            const elapsed = Date.now() - start;
+            tlsSocket.destroy();
+            onFinish(elapsed);
+          }
+        );
 
         tlsSocket.on('error', () => onFinish(-1));
       } else {
@@ -611,7 +900,7 @@ function updateTrayMenu(): void {
         if (isConnected) {
           disconnectVpn('Disconnected via Tray');
         } else {
-          const active = store.profiles.find(p => p.isSelected) || store.profiles[0];
+          const active = store.profiles.find((p) => p.isSelected) || store.profiles[0];
           if (active) startXray(active);
         }
       }
@@ -628,8 +917,9 @@ function updateTrayMenu(): void {
     { type: 'separator' },
     {
       label: 'Exit',
-      click: () => {
+      click: async () => {
         isQuitting = true;
+        await cleanupEverything();
         app.quit();
       }
     }
@@ -640,7 +930,8 @@ function updateTrayMenu(): void {
 }
 
 function createMainWindow(): void {
-  const iconPath = path.join(__dirname, '..', 'public', 'app_logo.png');
+  const iconPath = getAppIconPath();
+  const iconImage = fs.existsSync(iconPath) ? nativeImage.createFromPath(iconPath) : undefined;
 
   mainWindow = new BrowserWindow({
     width: 1060,
@@ -649,27 +940,29 @@ function createMainWindow(): void {
     minHeight: 620,
     backgroundColor: '#090D16',
     title: 'v2rayDP Desktop',
-    icon: fs.existsSync(iconPath) ? iconPath : undefined,
+    icon: iconImage,
+    show: !store.settings.startMinimized,
     autoHideMenuBar: true,
     webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
+      preload: path.join(app.getAppPath(), 'dist-electron', 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false
     }
   });
 
-  const isDev = process.env.NODE_ENV !== 'production';
-  if (isDev) {
-    mainWindow.loadURL('http://localhost:3000');
+  if (app.isPackaged) {
+    mainWindow.loadFile(path.join(app.getAppPath(), 'dist', 'index.html'));
   } else {
-    mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
+    mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL || 'http://localhost:3000');
   }
 
-  mainWindow.on('close', (event) => {
+  mainWindow.on('close', async (event) => {
     if (!isQuitting && store.settings.closeToTray) {
       event.preventDefault();
       mainWindow?.hide();
+    } else {
+      await cleanupEverything();
     }
   });
 
@@ -682,43 +975,64 @@ function createMainWindow(): void {
 }
 
 function createSystemTray(): void {
-  const iconPath = path.join(__dirname, '..', 'public', 'app_logo.png');
-  if (fs.existsSync(iconPath)) {
-    tray = new Tray(iconPath);
-  } else {
-    return;
-  }
+  const iconPath = getAppIconPath();
+  if (!fs.existsSync(iconPath)) return;
 
-  tray.on('double-click', () => {
-    if (mainWindow) {
-      if (mainWindow.isVisible()) {
-        mainWindow.focus();
-      } else {
-        mainWindow.show();
+  try {
+    const trayImg = nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 });
+    tray = new Tray(trayImg);
+
+    tray.on('double-click', () => {
+      if (mainWindow) {
+        if (mainWindow.isVisible()) {
+          mainWindow.focus();
+        } else {
+          mainWindow.show();
+        }
       }
-    }
-  });
+    });
 
-  updateTrayMenu();
+    updateTrayMenu();
+  } catch (err) {
+    console.error('Failed to initialize tray:', err);
+  }
 }
 
-// Cleanup on quit or crash
-async function cleanupEverything() {
-  stopXray();
+// Guaranteed Cleanup on all exit paths (B2)
+async function cleanupEverything(): Promise<void> {
+  if (cleanedUp) return;
+  cleanedUp = true;
+
+  stopTrafficMonitor();
+  stopWifiAutomationMonitor();
+  await stopCurrentXrayProcess();
   await WindowsProxyManager.restoreSystemProxy();
 }
 
 app.on('before-quit', async (event) => {
-  if (!isQuitting) {
-    isQuitting = true;
+  if (!cleanedUp) {
     event.preventDefault();
     await cleanupEverything();
     app.quit();
   }
 });
 
+app.on('will-quit', async () => {
+  await cleanupEverything();
+});
+
+(app as any).on('session-end', async () => {
+  await cleanupEverything();
+});
+
 process.on('uncaughtException', async (err) => {
   console.error('Uncaught Exception:', err);
+  await cleanupEverything();
+  process.exit(1);
+});
+
+process.on('unhandledRejection', async (err) => {
+  console.error('Unhandled Rejection:', err);
   await cleanupEverything();
   process.exit(1);
 });
@@ -728,22 +1042,34 @@ process.on('SIGINT', async () => {
   process.exit(0);
 });
 
-app.whenReady().then(() => {
+process.on('SIGTERM', async () => {
+  await cleanupEverything();
+  process.exit(0);
+});
+
+// App Lifecycle
+app.whenReady().then(async () => {
+  // If proxy_backup.json exists from previous crash/kill, restore it immediately
+  if (fs.existsSync(proxyBackupPath)) {
+    console.log('Restoring Windows proxy from previous session backup...');
+    await WindowsProxyManager.restoreSystemProxy();
+  }
+
   createMainWindow();
   createSystemTray();
   startWifiAutomationMonitor();
 
-  // Check auto-start with Windows
-  if (store.settings.startWithWindows) {
+  // Configure Windows auto-start (app.setLoginItemSettings)
+  if (process.platform === 'win32') {
     app.setLoginItemSettings({
-      openAtLogin: true,
-      args: ['--minimized']
+      openAtLogin: Boolean(store.settings.startWithWindows),
+      args: store.settings.startMinimized ? ['--minimized'] : []
     });
   }
 
-  // Auto-connect on launch if enabled
+  // Auto-connect on app launch if enabled (B8)
   if (store.settings.autoConnectOnLaunch) {
-    const active = store.profiles.find(p => p.isSelected) || store.profiles[0];
+    const active = store.profiles.find((p) => p.isSelected) || store.profiles[0];
     if (active) {
       setTimeout(() => startXray(active), 1500);
     }
@@ -754,17 +1080,20 @@ app.whenReady().then(() => {
       createMainWindow();
     }
   });
+
+  // Dev-time verification that every channel used in preload has a handler
+  verifyIpcHandlersRegistered();
 });
 
 // ==========================================
-// IPC Handlers
+// IPC Handlers Implementation (B1)
 // ==========================================
 ipcMain.handle('get-profiles', async () => store.profiles);
 
 ipcMain.handle('save-profile', async (_e, profileData: Partial<ServerProfile>) => {
   let updated: ServerProfile;
   if (profileData.id) {
-    const idx = store.profiles.findIndex(p => p.id === profileData.id);
+    const idx = store.profiles.findIndex((p) => p.id === profileData.id);
     if (idx !== -1) {
       updated = { ...store.profiles[idx], ...profileData } as ServerProfile;
       store.profiles[idx] = updated;
@@ -809,8 +1138,8 @@ ipcMain.handle('save-profile', async (_e, profileData: Partial<ServerProfile>) =
 });
 
 ipcMain.handle('delete-profile', async (_e, id: string) => {
-  store.profiles = store.profiles.filter(p => p.id !== id);
-  if (store.profiles.length > 0 && !store.profiles.some(p => p.isSelected)) {
+  store.profiles = store.profiles.filter((p) => p.id !== id);
+  if (store.profiles.length > 0 && !store.profiles.some((p) => p.isSelected)) {
     store.profiles[0].isSelected = true;
   }
   saveStore();
@@ -819,7 +1148,7 @@ ipcMain.handle('delete-profile', async (_e, id: string) => {
 
 ipcMain.handle('select-profile', async (_e, id: string) => {
   let selected: ServerProfile | null = null;
-  store.profiles.forEach(p => {
+  store.profiles.forEach((p) => {
     p.isSelected = p.id === id;
     if (p.isSelected) selected = p;
   });
@@ -830,10 +1159,115 @@ ipcMain.handle('select-profile', async (_e, id: string) => {
   return true;
 });
 
+// B1: Duplicate Profile handler
+ipcMain.handle('duplicate-profile', async (_e, id: string) => {
+  const target = store.profiles.find((p) => p.id === id);
+  if (!target) return null;
+
+  const cloned: ServerProfile = {
+    ...target,
+    id: `prof-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    name: `${target.name} (Copy)`,
+    isSelected: false,
+    pingLatencyMs: -1,
+    createdAt: Date.now()
+  };
+
+  store.profiles.push(cloned);
+  saveStore();
+  return cloned;
+});
+
+// B1: Import profiles from multi-line text (vless:// and vmess://)
+ipcMain.handle('import-profiles-text', async (_e, text: string) => {
+  const lines = (text || '').split(/\r?\n/);
+  let added = 0;
+  let failed = 0;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (trimmed.toLowerCase().startsWith('vless://') || trimmed.toLowerCase().startsWith('vmess://')) {
+      try {
+        const parsed = VmessLinkParser.parse(trimmed);
+        parsed.id = `prof-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+        parsed.createdAt = Date.now();
+        parsed.isSelected = store.profiles.length === 0;
+        store.profiles.push(parsed);
+        added++;
+      } catch (err) {
+        failed++;
+      }
+    }
+  }
+
+  saveStore();
+  return { added, failed };
+});
+
+// B1: Export profiles JSON
+ipcMain.handle('export-profiles-json', async () => {
+  return JSON.stringify(store.profiles, null, 2);
+});
+
+// B1: Import profiles JSON
+ipcMain.handle('import-profiles-json', async (_e, jsonStr: string) => {
+  let added = 0;
+  const errors: string[] = [];
+
+  try {
+    const parsed = JSON.parse(jsonStr);
+    const list = Array.isArray(parsed) ? parsed : [parsed];
+
+    for (const item of list) {
+      if (item.address && item.port && item.uuid && (item.protocol === 'vless' || item.protocol === 'vmess')) {
+        const profile: ServerProfile = {
+          id: `prof-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+          name: item.name || 'Imported Node',
+          protocol: item.protocol,
+          address: item.address,
+          port: item.port,
+          uuid: item.uuid,
+          alterId: item.alterId || 0,
+          security: item.security || 'none',
+          network: item.network || 'tcp',
+          headerType: item.headerType || 'none',
+          host: item.host || '',
+          path: item.path || '/',
+          tls: item.tls || 'none',
+          sni: item.sni || '',
+          alpn: item.alpn || '',
+          flow: item.flow || '',
+          publicKey: item.publicKey || '',
+          shortId: item.shortId || '',
+          fingerprint: item.fingerprint || 'chrome',
+          spiderX: item.spiderX || '/',
+          serviceName: item.serviceName || '',
+          grpcMode: item.grpcMode || 'gun',
+          allowInsecure: true,
+          isSelected: store.profiles.length === 0,
+          pingLatencyMs: -1,
+          createdAt: Date.now()
+        };
+        store.profiles.push(profile);
+        added++;
+      } else {
+        errors.push(`Invalid node config for ${item.name || 'unnamed'}`);
+      }
+    }
+
+    saveStore();
+  } catch (err: unknown) {
+    errors.push(`JSON parse error: ${(err as Error).message}`);
+  }
+
+  return { added, errors };
+});
+
 ipcMain.handle('start-vpn', async (_e, profileId?: string) => {
   const target = profileId
-    ? store.profiles.find(p => p.id === profileId)
-    : (store.profiles.find(p => p.isSelected) || store.profiles[0]);
+    ? store.profiles.find((p) => p.id === profileId)
+    : store.profiles.find((p) => p.isSelected) || store.profiles[0];
   if (!target) return false;
 
   // Preserve user manually chosen profile on this network
@@ -877,7 +1311,7 @@ ipcMain.handle('get-connection-state', async () => currentConnectionState);
 ipcMain.handle('get-traffic-stats', async () => trafficStats);
 
 ipcMain.handle('test-latency', async (_e, profileId: string) => {
-  const profile = store.profiles.find(p => p.id === profileId);
+  const profile = store.profiles.find((p) => p.id === profileId);
   if (!profile) return -1;
   const ping = await testServerLatency(profile);
   profile.pingLatencyMs = ping;
@@ -928,10 +1362,8 @@ ipcMain.handle('get-hotspot-info', async () => {
 ipcMain.handle('save-hotspot-settings', async (_e, settings: HotspotSettings) => {
   store.hotspot = settings;
   saveStore();
-  if (currentConnectionState.status === 'connected') {
-    const active = store.profiles.find(p => p.isSelected) || store.profiles[0];
-    if (active) startXray(active);
-  }
+  // B4: Restart with currently RUNNING profile
+  await restartRunningXrayIfActive();
   return true;
 });
 
@@ -942,7 +1374,7 @@ ipcMain.handle('open-hotspot-settings', async () => {
 
 ipcMain.handle('add-firewall-rule', async (_e, port: number) => {
   return new Promise((resolve) => {
-    const cmd = `powershell -Command "Start-Process netsh -ArgumentList 'advfirewall firewall add rule name=\\\"v2rayDP Hotspot Share\\\" dir=in action=allow protocol=TCP localport=${port},${port + 1}' -Verb RunAs"`;
+    const cmd = `powershell.exe -NoProfile -Command "Start-Process netsh -ArgumentList 'advfirewall firewall add rule name=\\\"v2rayDP Hotspot Share\\\" dir=in action=allow protocol=TCP localport=${port},${port + 1}' -Verb RunAs"`;
     exec(cmd, (err) => {
       if (err) {
         resolve({ success: false, message: `Firewall elevation failed: ${err.message}` });
@@ -954,26 +1386,127 @@ ipcMain.handle('add-firewall-rule', async (_e, port: number) => {
 });
 
 ipcMain.handle('get-block-settings', async () => store.block);
+
 ipcMain.handle('save-block-settings', async (_e, settings: BlockSettings) => {
   store.block = settings;
   saveStore();
-  if (currentConnectionState.status === 'connected') {
-    const active = store.profiles.find(p => p.isSelected) || store.profiles[0];
-    if (active) startXray(active);
-  }
+  // B4: Restart with currently RUNNING profile
+  await restartRunningXrayIfActive();
   return true;
 });
 
+// B1: Update blocklists via Node fetch
+ipcMain.handle('update-blocklists', async () => {
+  if (!fs.existsSync(blocklistsDir)) {
+    fs.mkdirSync(blocklistsDir, { recursive: true });
+  }
+
+  const sources = store.block.sources && store.block.sources.length > 0
+    ? store.block.sources
+    : (defaultSources as any[]);
+
+  const uniqueDomains = new Set<string>();
+
+  for (const source of sources) {
+    try {
+      addLog('INFO', 'BlockManager', `Downloading blocklist "${source.name}" from ${source.url}`);
+      const res = await fetch(source.url, {
+        signal: AbortSignal.timeout(30000)
+      });
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+      }
+
+      const bodyText = await res.text();
+      const lines = bodyText.split('\n');
+      const parsedDomains: string[] = [];
+
+      for (const line of lines) {
+        const domain = BlockManager.parseDomainFromLine(line);
+        if (domain) {
+          parsedDomains.push(domain);
+          if (source.enabled) {
+            uniqueDomains.add(domain);
+          }
+        }
+      }
+
+      source.domainCount = parsedDomains.length;
+      const targetFile = path.join(blocklistsDir, `${source.id}.txt`);
+      fs.writeFileSync(targetFile, parsedDomains.join('\n'), 'utf8');
+      addLog('INFO', 'BlockManager', `Saved ${parsedDomains.length} domains for "${source.name}"`);
+    } catch (err: unknown) {
+      addLog('WARN', 'BlockManager', `Failed to update source "${source.name}": ${(err as Error).message}`);
+    }
+  }
+
+  // Add custom rules into total unique domains count
+  for (const rule of store.block.customRules || []) {
+    const norm = BlockManager.normalizeCustomRule(rule);
+    if (norm) uniqueDomains.add(norm);
+  }
+
+  store.block.sources = sources;
+  store.block.totalDomains = uniqueDomains.size;
+  store.block.lastUpdatedTimestamp = Date.now();
+  saveStore();
+
+  // Restart running proxy with updated domains
+  await restartRunningXrayIfActive();
+
+  return { success: true, count: store.block.totalDomains };
+});
+
+// B1: Add custom block rule
+ipcMain.handle('add-custom-block-rule', async (_e, rawDomain: string) => {
+  const norm = BlockManager.normalizeCustomRule(rawDomain);
+  if (!norm) return false;
+  if (!store.block.customRules) store.block.customRules = [];
+  if (store.block.customRules.includes(norm)) return false;
+
+  store.block.customRules.push(norm);
+  store.block.totalDomains = (store.block.totalDomains || 0) + 1;
+  saveStore();
+  addLog('INFO', 'BlockManager', `Added custom blocked domain: ${norm}`);
+
+  await restartRunningXrayIfActive();
+  return true;
+});
+
+// B1: Remove custom block rule
+ipcMain.handle('remove-custom-block-rule', async (_e, rawDomain: string) => {
+  if (!store.block.customRules) return false;
+  const initialLen = store.block.customRules.length;
+  store.block.customRules = store.block.customRules.filter((d) => d !== rawDomain);
+
+  if (store.block.customRules.length !== initialLen) {
+    store.block.totalDomains = Math.max(0, (store.block.totalDomains || 1) - 1);
+    saveStore();
+    addLog('INFO', 'BlockManager', `Removed custom blocked domain: ${rawDomain}`);
+
+    await restartRunningXrayIfActive();
+    return true;
+  }
+  return false;
+});
+
+// B8: Desktop Settings as single source of truth
 ipcMain.handle('get-desktop-settings', async () => store.settings);
+
 ipcMain.handle('save-desktop-settings', async (_e, settings: DesktopSettings) => {
   store.settings = settings;
   saveStore();
+
   if (process.platform === 'win32') {
     app.setLoginItemSettings({
-      openAtLogin: settings.startWithWindows,
+      openAtLogin: Boolean(settings.startWithWindows),
       args: settings.startMinimized ? ['--minimized'] : []
     });
   }
+
+  // B4: If running, restart with currently active profile
+  await restartRunningXrayIfActive();
   return true;
 });
 
@@ -991,8 +1524,59 @@ ipcMain.handle('open-external-url', async (_e, url: string) => {
 ipcMain.handle('reset-app', async () => {
   try {
     if (fs.existsSync(storeFilePath)) fs.unlinkSync(storeFilePath);
+    if (fs.existsSync(proxyBackupPath)) fs.unlinkSync(proxyBackupPath);
   } catch {}
   store = loadStore();
   mainWindow?.reload();
   return true;
 });
+
+// B1: Dev-time check that every channel used in preload has an ipcMain handler
+function verifyIpcHandlersRegistered(): void {
+  const expectedChannels = [
+    'get-profiles',
+    'save-profile',
+    'delete-profile',
+    'select-profile',
+    'duplicate-profile',
+    'import-profiles-text',
+    'export-profiles-json',
+    'import-profiles-json',
+    'start-vpn',
+    'stop-vpn',
+    'get-connection-state',
+    'get-traffic-stats',
+    'test-latency',
+    'test-all-latencies',
+    'get-automation-settings',
+    'save-automation-settings',
+    'get-wifi-status',
+    'reset-manual-override',
+    'get-hotspot-info',
+    'save-hotspot-settings',
+    'open-hotspot-settings',
+    'add-firewall-rule',
+    'get-block-settings',
+    'save-block-settings',
+    'update-blocklists',
+    'add-custom-block-rule',
+    'remove-custom-block-rule',
+    'get-desktop-settings',
+    'save-desktop-settings',
+    'reset-app',
+    'get-logs',
+    'clear-logs',
+    'open-external-url'
+  ];
+
+  const registeredHandlers: string[] = (ipcMain as any)._invokeHandlers
+    ? Array.from((ipcMain as any)._invokeHandlers.keys())
+    : [];
+
+  const missing = expectedChannels.filter((c) => !registeredHandlers.includes(c));
+  if (missing.length > 0) {
+    console.error(`[IPC DEV CHECK WARNING] Missing ipcMain handlers: ${missing.join(', ')}`);
+  } else {
+    console.log(`✓ Verified: All ${expectedChannels.length} IPC channels are registered in main.ts`);
+  }
+}

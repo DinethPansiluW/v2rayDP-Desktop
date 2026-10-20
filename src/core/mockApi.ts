@@ -124,9 +124,6 @@ const DEFAULT_PROFILES: ServerProfile[] = [
 
 const DEFAULT_AUTOMATION: AutomationSettings = {
   isAutomationGloballyEnabled: true,
-  startOnLaunch: false,
-  startMinimizedToTray: false,
-  startWithWindows: false,
   rules: [
     {
       id: 'rule-home-office',

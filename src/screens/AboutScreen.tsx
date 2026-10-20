@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { SocialLinks } from '../core/SocialLinks';
 import { ExternalLink, Copy, Check, Info, Heart, Shield, Code, Globe, MessageSquare, Send } from 'lucide-react';
+import logo from '../assets/logo.png';
 
 export const AboutScreen: React.FC = () => {
   const [copiedHandle, setCopiedHandle] = useState<string | null>(null);
@@ -50,7 +51,7 @@ export const AboutScreen: React.FC = () => {
         {/* App Hero */}
         <div className="flex flex-col sm:flex-row items-center sm:items-start space-y-4 sm:space-y-0 sm:space-x-5 text-center sm:text-left">
           <div className="w-20 h-20 rounded-2xl bg-slate-900 border-2 border-cyan-400/80 p-1 shadow-xl shadow-cyan-500/20 flex items-center justify-center shrink-0">
-            <img src="/app_logo.png" alt="v2rayDP Logo" className="w-full h-full object-contain rounded-xl" />
+            <img src={logo} alt="v2rayDP Logo" className="w-full h-full object-contain rounded-xl" />
           </div>
 
           <div className="space-y-1">

@@ -6,7 +6,7 @@
     "lib": ["ES2022", "DOM"],
     "skipLibCheck": true,
     "rootDir": ".",
-    "outDir": "dist-electron",
+    "noEmit": true,
     "strict": false,
     "esModuleInterop": true,
     "resolveJsonModule": true

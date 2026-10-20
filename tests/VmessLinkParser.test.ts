@@ -85,11 +85,18 @@ describe('VmessLinkParser', () => {
 
     const parsed = JSON.parse(jsonString);
 
-    // Inbounds check
-    expect(parsed.inbounds).toHaveLength(2);
+    // Inbounds check (socks-in, http-in, api for StatsService)
+    expect(parsed.inbounds).toHaveLength(3);
     expect(parsed.inbounds[0].port).toBe(10808);
     expect(parsed.inbounds[0].listen).toBe('0.0.0.0'); // Hotspot sharing
     expect(parsed.inbounds[1].port).toBe(10809);
+    expect(parsed.inbounds[2].tag).toBe('api');
+    expect(parsed.inbounds[2].port).toBe(10085);
+
+    // Stats & API check
+    expect(parsed.stats).toBeDefined();
+    expect(parsed.api.services).toContain('StatsService');
+    expect(parsed.policy.system.statsOutboundUplink).toBe(true);
 
     // Outbounds check
     expect(parsed.outbounds.length).toBeGreaterThanOrEqual(3);
